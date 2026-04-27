@@ -1,0 +1,62 @@
+{
+  "seed": 1337,
+  "device": "mps",
+
+  "data": {
+    "pt_path": "./cache/Re_600_normalized.pt",
+    "num_workers": 0,
+    "use_y_as_target": false,
+    "window_size": 4,
+    "stride": 1,
+    "split_by_z": true,
+    "z_index": 2,
+    "z_tol": 0.0
+  },
+
+  "features": {
+    "use_columns": [0, 1, 2, 6],
+    "target_columns": [0, 1, 2, 6],
+    "names": [
+      "pressure",
+      "velocity_x",
+      "velocity_y",
+      "velocity_z",
+      "vorticity_x",
+      "vorticity_y",
+      "vorticity_z"
+    ],
+    "normalize": true,
+    "include_pos": true,
+    "pos_columns": [0, 1]
+  },
+
+  "split": {
+    "train": 0.8,
+    "val": 0.1,
+    "test": 0.1
+  },
+
+  "train": {
+    "epochs": 100,
+    "validation_every_epochs": 1,
+    "batch_size": 1,
+    "lr": 0.0005,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "multi_step_K": 2,
+    "autoregressive": true,
+    "save_dir": "./runs_karman_basic"
+  },
+
+  "model": {
+    "name": "FeatureNet",
+    "hidden": 128,
+    "layers": 3,
+    "dropout": 0.1
+  },
+
+  "loss": {
+    "use_huber": false,
+    "huber_delta": 0.05
+  }
+}

@@ -1,0 +1,83 @@
+                 Von Kármán Cylinder Flow (SimFlow 5.0, PISO) – 
+                 Reynolds-Based Setup 
+                  
+                 Physics & numerics: 
+                          Physics: Incompressible · Transient · Laminar 
+                          Solver: PISO (pisoFoam) 
+                          Schemes: Backward (time), LUST (convection) 
+                          2D: front/back = Empty 
+                          Run controls: 
+                           Simulation time = 5 s, Δt = 1e-3 s, Output interval = 0.025 s (= 25 steps) 
+                 Parameters & etc. 
+                 1.  Parameters 
+                     •   d = 0.01 (m) 
+                     •   nu = 1.51e-05 (m²/s) 
+                     •   Re (20 or 100) 
+                     •   u = Re*nu/d 
+                 2.  Transport Properties 
+                     •   Kinematic viscosity = nu 
+                 3.  Boundary Conditions → Inlet 
+                     •   Velocity Inlet 
+                     •   Reference Value = u 
+                     •   Outlet = 0 Pa, Cylinder = no-slip, Slip/Symmetry, front/back = Empty 
+                 4.  Monitors / Function Objects 
+                     •   forceCoeffs U∞ = u 
+                     •   vorticity (Full Time Range → Calculate) 
+                 Numbers (with d = 0.01, ν = nu) 
+                                                              ������ = Re ⋅ ������ 
+                                                                      ������
+                     •   Re=20 → U = 0.0302 m/s 
+                     •   Re=100 → U = 0.1510 m/s 
+                                                   
+                 Geometry & Mesh 
+                          Min [m]: (X, Y) = (-0.05, -0.05) 
+                          Max [m]: (X, Y) = (0.15, 0.05) 
+                          Mesh Division = 150 / 100 
+                                                                                                                        
+                                                   
+                 Results – Oscillation Plot 
+                          Re = 20 
+                                                                                                       
+                          Re = 100 
+                                                                                                       
+                                                   
+                 Results – Vorticity Contour Plot 
+                          Re = 20, t = 5 s 
+                                                                                                                        
+                          Re = 100, t = 5 s 
+                                                                                                                        
+                  
+                                                   
+                Kármán vortex street/ 
+                ├─ Reynolds_20/ 
+                │  ├─ VTK/ 
+                │  │  ├─ Reynolds20.vtm.series                     # time-series index 
+                │  │  ├─ Reynolds20_0.vtm 
+                │  │  ├─ Reynolds20_25.vtm 
+                │  │  ├─ ...   
+                │  │  ├─ Reynolds20_4975/ 
+                │  │  └─ Reynolds20_5000/ 
+                │  ├─ probe_centerline_u.csv                       # t, Ux, Uy, |U|, p, vorticityZ, X, Y 
+                │  ├─ metadata.txt 
+                │  ├─ Reynolds20_oscillation_data.csv 
+                │  ├─ Reynolds20_oscillation_plot.png 
+                │  ├─ Reynolds20_vorticity.mp4 
+                │  ├─ Reynolds20_vorticity_2s.png 
+                │  ├─ Reynolds20_vorticity_5s.png 
+                │  └─ solver.txt 
+                ├─ Reynolds_100/ 
+                │  ├─ VTK/ 
+                │  │  ├─ Reynolds100.vtm.series 
+                │  │  ├─ Reynolds100_0.vtm 
+                │  │  ├─ Reynolds100_25.vtm 
+                │  │  ├─ ... 
+                │  │  ├─ Reynolds100_***** / 
+                │  │  └─ ... 
+                │  ├─ probe_centerline_u.csv 
+                │  ├─ metadata.txt 
+                │  ├─ Reynolds100_oscillation_data.csv 
+                │  ├─ Reynolds100_oscillation_plot.png 
+                │  ├─ Reynolds100_vorticity.mp4 
+                │  ├─ Reynolds100_vorticity_2s.png 
+                │  └─ Reynolds100_vorticity_5s.png 
+                └─ README.md 

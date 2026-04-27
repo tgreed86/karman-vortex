@@ -1,0 +1,23 @@
+{
+  "checkpoint": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/runs_karman_basic/final_model.pt",
+  "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/cache/Re_600_normalized.pt",
+  "n_steps": 50,
+  "start_t": 25,
+  "horizon": 50,
+  "force_teacher": true,
+  "autoregressive_requested": false,
+  "used_autoregressive": false,
+  "z_slice": null,
+  "mean_mae": 0.015275561846792698,
+  "target_label": "Target y(t)",
+  "input_label": "Input x(t)",
+  "pred_gt_only": true,
+  "rollout_seconds": 2.352098166011274,
+  "gif_seconds": 53.111857125069946,
+  "gif_paths": [
+    "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/runs_karman_basic/rollout_t25_H50/rollout_00_pressure.gif",
+    "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/runs_karman_basic/rollout_t25_H50/rollout_01_velocity_x.gif",
+    "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/runs_karman_basic/rollout_t25_H50/rollout_02_velocity_y.gif",
+    "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/karman_vortex/Physics-Aware/runs_karman_basic/rollout_t25_H50/rollout_03_vorticity_z.gif"
+  ]
+}

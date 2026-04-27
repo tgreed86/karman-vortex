@@ -1,0 +1,82 @@
+         Simulation Results                                                       Re = 1
+         ‚Ä¢   Solver: PISO (Laminar)
+         ‚Ä¢   Schemes: Backward (time), LUST (convection)
+         ‚Ä¢   Reynolds number: 1, 20, 40, 50, 100, 150
+         ‚Ä¢   Run controls:
+                Simulation time = 10 s , Œît = 1e-3 s,
+                Output interval = 0.025 s (25 steps)
+                Used = 8 s data for shedding,
+                         3 s ~ 8 s data for post-wake data                        Re = 20
+         ‚Ä¢   Verified reference: 
+                Duranay et al. (2022),
+                An Experimental Study on Vortex-Induced 
+                Vibrations at TRSL2 and TRSL3 Flow Regimes
+                                                                                  Re = 40
+         Simulation Results                                                       Re = 50
+         ‚Ä¢   Solver: PISO (Laminar)
+         ‚Ä¢   Schemes: Backward (time), LUST (convection)
+         ‚Ä¢   Reynolds number: 1, 20, 40, 50, 100, 150
+         ‚Ä¢   Run controls:
+                Simulation time = 10 s , Œît = 1e-3 s,
+                Output interval = 0.025 s (25 steps)
+                Used = 8 s data for shedding,
+                         3 s ~ 8 s data for post-wake data                        Re = 100
+         ‚Ä¢   Verified reference: 
+                Duranay et al. (2022),
+                An Experimental Study on Vortex-Induced 
+                Vibrations at TRSL2 and TRSL3 Flow Regimes
+                                                                                  Re = 150
+                Post-Wake Macro Output Guide
+                ‚Ä¢     Automated post-processing of cylinder wake simulations ‚Äî extracts force data, performs FFT of Ì∞∂Ì†µ ‚Äã, 
+                      computes Strouhal number, and aggregates results for multiple Reynolds cases.                                                                               Ì∞øÌ†µ
+                1.      Per-case output (in each case or in central folder)
+                File / Figure                  Description
+                forces_clean.csv               Time history of (Ì∞∂Ì†µ , Ì∞∂Ì†µ , Ì∞∂Ì†µ ) after transient trimming
+                                                                            Ì±ëÌ†µ    Ì∞øÌ†µ    Ì±öÌ†µ
+                summary.json                   Case summary: Re, U, Ì∞∂Ì†µ                          , Ì±ìÌ†µ       , St, % errors vs reference
+                                                                                      Ì±ëÌ†µÌ±öÌ†µÌ±íÌ†µÌ±éÌ†µÌ±õÌ†µ    Ì±ùÌ†µÌ±íÌ†µÌ±éÌ†µÌ±òÌ†µ
+                CL_time.png                    Plot of Ì∞∂Ì†µ (Ì±°Ì†µ) vs time, showing periodic vortex shedding
+                                                             Ì∞øÌ†µ
+                CL_psd.png                     Power spectral density of Ì∞∂Ì†µ ; vertical dashed line shows dominant frequency used for St
+                                                                                           Ì∞øÌ†µ
+                2.      Central aggregate folder (e.g., post_wake_all)
+                File                                 Description
+                aggregate.csv                        Tabular summary for all scanned cases (Re, St, Ì∞∂Ì†µ                                      , errors)
+                                                                                                                                  Ì±ëÌ†µÌ±öÌ†µÌ±íÌ†µÌ±éÌ†µÌ±õÌ†µ
+                aggregate.json                       Same as CSV in JSON format
+                Re_St_scatter.png                    Reynolds number vs Strouhal number (with reference curve overlay)
+                Re_Cd_scatter.png                    Reynolds number vs mean drag coefficient (with reference data overlay)
+            RevsSt(Strouhal Number)
+            ‚Ä¢   Shows how the vortex shedding frequency changes with Reynolds number.
+                                                                           Ì±ìÌ†µÌ∞∑Ì†µ
+                                                                     Ì±ÜÌ†µÌ±°Ì†µ =
+                                                                           Ì±àÌ†µ
+                                                                             ‚àû
+            ‚Ä¢   It is the primary non-dimensional indicator of vortex shedding peridicity.
+            ‚Ä¢   For Re < 47, St ~ 0 (steady wake). As Re increases, St rises and tends to ~0.2 in the laminar vortex 
+                shedding regime.
+            RevsÌ±™Ì†µ (Mean Drag Coefficient)
+                                Ì≤ÖÌ†µ
+            ‚Ä¢   Shows how the mean drag on the cylinder changes with Reynolds number.
+                                                                            Ì∞πÌ†µ
+                                                                             Ì±ëÌ†µ
+                                                                  Ì∞∂Ì†µ  =
+                                                                   Ì±ëÌ†µ
+                                                                         1    2
+                                                                           ÌºåÌ†µÌ±àÌ†µ Ì∞∑Ì†µ
+                                                                              ‚àû
+                                                                         2
+            ‚Ä¢   It is the primary non-dimensional indicator of vortex shedding periodicity.
+            ‚Ä¢   For Re < 47, St ~ 0 (steady wake). As Re increases, St rises and tends to ~0.2 in the laminar vortex 
+                shedding regime.
+            Vorticity / Velocity (Ì±àÌ†µ) Results Data Guide
+            ‚Ä¢   Stores point coordinates and vorticity components at each time step for post-processing or validation.
+            ‚Ä¢   File Format:
+                   ‚Ä¢   Header row describes each column
+                   ‚Ä¢   Each subsequent row contains data for one point at a given time step
+            Column                                                  Description
+            TimeStep                                                Simulation time
+            Points:0, Points:1, Points:2                            X, Y, Z coordinates of the sample point
+            vorticity:0, vorticity:1, vorticity:2                   Vorticity vector components (ÌºîÌ†µÌ±•Ì†µ, ÌºîÌ†µÌ±¶Ì†µ, ÌºîÌ†µÌ±ßÌ†µ) at that point
+            U:0, U:1, U:2                                           Velocity components Ì±àÌ†µ , Ì±àÌ†µ , Ì±àÌ†µ ‚Äã at that point
+                                                                                               Ì±•Ì†µ   Ì±¶Ì†µ  Ì±ßÌ†µ

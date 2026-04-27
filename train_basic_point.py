@@ -1,0 +1,1443 @@
+#!/usr/bin/env python3
+"""
+train_basic_point.py
+
+Minimal temporal point-graph training script (no DEC/MLS physics, no AMR runtime mesh).
+
+Assumed data contract per timestep (PyG Data-like or dict-like):
+  - x:          [N, Fx] node features at time t
+  - edge_index: [2, E] or [E, 2] point connectivity
+  - pos:        [N, Dp] point coordinates (D=2 or 3 typical)
+Optional:
+  - y:          [N, Fy] supervised target at time t (if present and enabled)
+  - time/t/sim_time or global_params.timestep_current (for metadata only)
+
+Targets:
+  - if data.use_y_as_target=true and y exists: predict y_t from x_t
+  - otherwise: predict x_{t+1} from x_t
+
+Training modes:
+  - one-step pairs (legacy baseline)
+  - multi-step windows (shock-ramp style): unrolled autoregressive training where
+    predicted output at step k is fed as input at step k+1
+
+This script intentionally avoids all AMR/DEC/MLS pathways.
+
+Data source modes:
+  - single file: cfg.data.pt_path points to one .pt/.pth/.zip file
+  - pre-split directory: cfg.data.pt_path points to a directory containing
+    train/, val/, test/ subfolders with PT files for each split
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import io
+import json
+import os
+import random
+import time
+import zipfile
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import optim
+from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
+
+from models import FeatureNet
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _extract_attr(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _as_edge_index(x: Any) -> torch.Tensor:
+    ei = torch.as_tensor(x, dtype=torch.long)
+    if ei.ndim != 2:
+        raise ValueError(f"edge_index must be 2D, got {tuple(ei.shape)}")
+    if ei.size(0) == 2:
+        out = ei
+    elif ei.size(1) == 2:
+        out = ei.t().contiguous()
+    else:
+        raise ValueError(f"edge_index must be (2,E) or (E,2), got {tuple(ei.shape)}")
+    return out
+
+
+def _as_2d_float(x: Any, name: str) -> torch.Tensor:
+    t = torch.as_tensor(x, dtype=torch.float32)
+    if t.ndim == 1:
+        t = t.unsqueeze(-1)
+    if t.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got {tuple(t.shape)}")
+    return t
+
+
+def _extract_time(step_obj: Any) -> Optional[float]:
+    for key in ("time", "t", "sim_time"):
+        v = _extract_attr(step_obj, key, None)
+        if v is not None:
+            try:
+                return float(torch.as_tensor(v).view(-1)[0].item())
+            except Exception:
+                pass
+
+    gp = _extract_attr(step_obj, "global_params", None)
+    if isinstance(gp, dict):
+        for key in ("timestep_current", "time", "t"):
+            if key in gp:
+                try:
+                    return float(torch.as_tensor(gp[key]).view(-1)[0].item())
+                except Exception:
+                    pass
+    return None
+
+
+def _load_torch_object(path_or_buf: Any, map_location: str = "cpu") -> Any:
+    # Try modern options first; gracefully degrade for older torch versions.
+    attempts = [
+        {"map_location": map_location, "weights_only": False, "mmap": True},
+        {"map_location": map_location, "weights_only": False},
+        {"map_location": map_location},
+    ]
+    last_err: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            return torch.load(path_or_buf, **kwargs)
+        except TypeError as exc:
+            last_err = exc
+            continue
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("torch.load failed with all compatibility options.")
+
+
+def _load_pt_or_zip(path: str) -> Any:
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"PT path not found: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".pt", ".pth"):
+        return _load_torch_object(path, map_location="cpu")
+
+    if ext == ".zip":
+        with zipfile.ZipFile(path, "r") as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith((".pt", ".pth"))]
+            if not names:
+                raise RuntimeError(f"No .pt/.pth file found inside zip: {path}")
+            with zf.open(names[0], "r") as f:
+                buf = io.BytesIO(f.read())
+        return _load_torch_object(buf, map_location="cpu")
+
+    raise RuntimeError(f"Unsupported file extension: {ext}. Expected .pt/.pth/.zip")
+
+
+def _list_pt_like_files(root_dir: str) -> List[str]:
+    root_dir = os.path.expanduser(root_dir)
+    if not os.path.isdir(root_dir):
+        raise NotADirectoryError(f"Not a directory: {root_dir}")
+    out: List[str] = []
+    for dirpath, _dirnames, filenames in os.walk(root_dir):
+        for name in filenames:
+            low = name.lower()
+            if low.endswith(".pt") or low.endswith(".pth") or low.endswith(".zip"):
+                out.append(os.path.join(dirpath, name))
+    out.sort()
+    return out
+
+
+def _resolve_pt_source(pt_path: str) -> Dict[str, Any]:
+    """
+    Resolve cfg.data.pt_path into either:
+      - {"mode": "single_file", "path": "..."}
+      - {"mode": "pre_split_dir", "root": "...", "split_files": {...}}
+    """
+    p = os.path.expanduser(str(pt_path).strip())
+    if not p:
+        raise ValueError("cfg['data']['pt_path'] is required.")
+    if os.path.isfile(p):
+        return {"mode": "single_file", "path": p}
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"pt_path not found: {p}")
+
+    split_dirs = {k: os.path.join(p, k) for k in ("train", "val", "test")}
+    if not all(os.path.isdir(d) for d in split_dirs.values()):
+        missing = [k for k, d in split_dirs.items() if not os.path.isdir(d)]
+        raise ValueError(
+            "When cfg['data']['pt_path'] is a directory, it must contain "
+            f"train/, val/, test/ subdirectories. Missing: {missing}"
+        )
+
+    split_files: Dict[str, List[str]] = {}
+    for split_name, split_dir in split_dirs.items():
+        files = _list_pt_like_files(split_dir)
+        if len(files) == 0:
+            raise ValueError(f"No .pt/.pth/.zip files found under split directory: {split_dir}")
+        split_files[split_name] = files
+
+    return {"mode": "pre_split_dir", "root": p, "split_files": split_files}
+
+
+def _extract_series(obj: Any) -> List[Any]:
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for key in ("timesteps", "snapshots", "steps", "time_steps", "sequence", "data_list"):
+            if key in obj and isinstance(obj[key], list):
+                return obj[key]
+    # Single timestep object is not enough for temporal training.
+    raise ValueError(
+        "Could not find a list of timesteps in loaded object. "
+        "Expected list or dict with timesteps/snapshots/steps/sequence/data_list."
+    )
+
+
+def _select_columns(x: torch.Tensor, cols: Optional[Sequence[int]]) -> torch.Tensor:
+    if cols is None:
+        return x
+    if len(cols) == 0:
+        raise ValueError("Column selection list is empty.")
+    cols_t = torch.as_tensor([int(c) for c in cols], dtype=torch.long)
+    if int(cols_t.max().item()) >= x.size(1) or int(cols_t.min().item()) < 0:
+        raise ValueError(f"Column selection {list(cols)} out of bounds for tensor with shape {tuple(x.shape)}")
+    return x[:, cols_t]
+
+
+def _extract_step_fields(step: Any) -> Dict[str, Any]:
+    x = _extract_attr(step, "x", None)
+    y = _extract_attr(step, "y", None)
+    pos = _extract_attr(step, "pos", _extract_attr(step, "xy", None))
+    edge_index = _extract_attr(step, "edge_index", _extract_attr(step, "ei", None))
+    if x is None:
+        x = _extract_attr(step, "features", None)
+
+    if x is None or pos is None or edge_index is None:
+        missing = []
+        if x is None:
+            missing.append("x/features")
+        if pos is None:
+            missing.append("pos/xy")
+        if edge_index is None:
+            missing.append("edge_index/ei")
+        raise KeyError(f"Timestep is missing required fields: {', '.join(missing)}")
+
+    out = {
+        "x": _as_2d_float(x, "x"),
+        "y": None if y is None else _as_2d_float(y, "y"),
+        "pos": _as_2d_float(pos, "pos"),
+        "edge_index": _as_edge_index(edge_index),
+        "time": _extract_time(step),
+        "global_params": _extract_attr(step, "global_params", None),
+    }
+    return out
+
+
+def _build_z_groups(z: torch.Tensor, z_tol: float) -> List[torch.Tensor]:
+    z = z.view(-1).to(torch.float32)
+    if z.numel() == 0:
+        return []
+
+    if z_tol > 0:
+        z0 = z.min()
+        keys = torch.round((z - z0) / float(z_tol)).to(torch.long)
+    else:
+        # Exact grouping (typical when slices are stored at exact z values).
+        _, keys = torch.unique(z, sorted=True, return_inverse=True)
+
+    groups: List[torch.Tensor] = []
+    for g in torch.unique(keys, sorted=True):
+        idx = torch.nonzero(keys == g, as_tuple=False).view(-1)
+        if idx.numel() > 0:
+            groups.append(idx)
+    return groups
+
+
+def _subgraph_by_index(
+    x: torch.Tensor,
+    y: Optional[torch.Tensor],
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    keep_idx: torch.Tensor,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    keep_idx = keep_idx.to(torch.long)
+    n = x.size(0)
+    remap = torch.full((n,), -1, dtype=torch.long)
+    remap[keep_idx] = torch.arange(keep_idx.numel(), dtype=torch.long)
+
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    valid = (
+        (src >= 0)
+        & (src < n)
+        & (dst >= 0)
+        & (dst < n)
+        & (remap[src] >= 0)
+        & (remap[dst] >= 0)
+        & (src != dst)
+    )
+    ei_sub = torch.stack([remap[src[valid]], remap[dst[valid]]], dim=0)
+
+    return (
+        x.index_select(0, keep_idx),
+        None if y is None else y.index_select(0, keep_idx),
+        pos.index_select(0, keep_idx),
+        ei_sub,
+    )
+
+
+@dataclass
+class PointPair:
+    x: torch.Tensor
+    y: torch.Tensor
+    pos: torch.Tensor
+    edge_index: torch.Tensor
+    t_src: Optional[float] = None
+    t_dst: Optional[float] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+class PointGraphTemporalDataset(Dataset):
+    """
+    Temporal point-graph pairs for one-step supervision.
+    """
+
+    def __init__(self, cfg: Dict[str, Any], pt_paths: Optional[Sequence[str]] = None):
+        super().__init__()
+        data_cfg = cfg.get("data", {}) or {}
+        feat_cfg = cfg.get("features", {}) or {}
+
+        if pt_paths is None:
+            pt_path = str(data_cfg.get("pt_path", "")).strip()
+            if not pt_path:
+                raise ValueError("cfg['data']['pt_path'] is required.")
+            pt_paths = [pt_path]
+        pt_paths = [os.path.expanduser(str(p)) for p in pt_paths]
+        if len(pt_paths) == 0:
+            raise ValueError("PointGraphTemporalDataset requires at least one PT path.")
+
+        use_y_target = bool(data_cfg.get("use_y_as_target", True))
+        split_by_z = bool(data_cfg.get("split_by_z", False))
+        z_index = int(data_cfg.get("z_index", 2))
+        z_tol = float(data_cfg.get("z_tol", 0.0))
+
+        x_cols = feat_cfg.get("use_columns", None)
+        y_cols = feat_cfg.get("target_columns", None)
+        pos_cols = feat_cfg.get("pos_columns", None)
+
+        x_cols = None if x_cols is None else [int(c) for c in x_cols]
+        y_cols = x_cols if y_cols is None else [int(c) for c in y_cols]
+        pos_cols = None if pos_cols is None else [int(c) for c in pos_cols]
+
+        pairs: List[PointPair] = []
+        for src_idx, src_path in enumerate(pt_paths):
+            raw_obj = _load_pt_or_zip(src_path)
+            raw_steps = _extract_series(raw_obj)
+            if len(raw_steps) < 2:
+                raise ValueError(
+                    f"Need at least 2 timesteps in source file, found {len(raw_steps)}: {src_path}"
+                )
+            steps = [_extract_step_fields(s) for s in raw_steps]
+
+            for t in range(len(steps) - 1):
+                s0 = steps[t]
+                s1 = steps[t + 1]
+
+                x0 = s0["x"]
+                pos0 = s0["pos"]
+                ei0 = s0["edge_index"]
+
+                # Target selection policy.
+                if use_y_target and (s0["y"] is not None):
+                    y_target = s0["y"]
+                else:
+                    y_target = s1["x"]
+
+                if x0.size(0) != y_target.size(0):
+                    raise ValueError(
+                        f"Node count mismatch at pair t={t}: "
+                        f"x_t has {x0.size(0)} nodes, target has {y_target.size(0)}. "
+                        f"(source={src_path})"
+                    )
+                if x0.size(0) != pos0.size(0):
+                    raise ValueError(
+                        f"Node count mismatch at pair t={t}: "
+                        f"x_t has {x0.size(0)} nodes, pos has {pos0.size(0)}. "
+                        f"(source={src_path})"
+                    )
+
+                x_sel = _select_columns(x0, x_cols)
+                y_sel = _select_columns(y_target, y_cols)
+                pos_sel = _select_columns(pos0, pos_cols)
+
+                if split_by_z:
+                    if z_index < 0 or z_index >= pos0.size(1):
+                        raise ValueError(
+                            f"split_by_z requested with z_index={z_index}, but pos has shape {tuple(pos0.shape)} "
+                            f"(source={src_path})"
+                        )
+                    z = pos0[:, z_index]
+                    groups = _build_z_groups(z, z_tol=z_tol)
+                    for gidx, keep in enumerate(groups):
+                        xs, ys, ps, eis = _subgraph_by_index(x_sel, y_sel, pos_sel, ei0, keep)
+                        if xs.size(0) == 0:
+                            continue
+                        pairs.append(
+                            PointPair(
+                                x=xs,
+                                y=ys,
+                                pos=ps,
+                                edge_index=eis,
+                                t_src=s0["time"],
+                                t_dst=s1["time"],
+                                meta={
+                                    "pair_t": t,
+                                    "z_group": gidx,
+                                    "source_index": src_idx,
+                                    "source_path": os.path.abspath(src_path),
+                                },
+                            )
+                        )
+                else:
+                    pairs.append(
+                        PointPair(
+                            x=x_sel,
+                            y=y_sel,
+                            pos=pos_sel,
+                            edge_index=ei0,
+                            t_src=s0["time"],
+                            t_dst=s1["time"],
+                            meta={
+                                "pair_t": t,
+                                "source_index": src_idx,
+                                "source_path": os.path.abspath(src_path),
+                            },
+                        )
+                    )
+
+        if len(pairs) == 0:
+            raise RuntimeError("No training pairs were built from the dataset.")
+
+        self.pairs = pairs
+        self.x_dim = int(self.pairs[0].x.size(1))
+        self.y_dim = int(self.pairs[0].y.size(1))
+        self.pos_dim = int(self.pairs[0].pos.size(1))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        p = self.pairs[idx]
+        return {
+            "x": p.x,
+            "y": p.y,
+            "pos": p.pos,
+            "edge_index": p.edge_index,
+            "t_src": p.t_src,
+            "t_dst": p.t_dst,
+            "meta": p.meta,
+        }
+
+
+@dataclass
+class PointWindow:
+    x_list: List[torch.Tensor]
+    y_list: List[torch.Tensor]
+    pos_list: List[torch.Tensor]
+    edge_index_list: List[torch.Tensor]
+    t_list: List[Optional[float]]
+    meta: Optional[Dict[str, Any]] = None
+
+
+class PointGraphWindowDataset(Dataset):
+    """
+    Contiguous windows of timesteps for multi-step autoregressive training.
+
+    Each sample contains K timesteps and K-1 supervised transitions.
+    """
+
+    def __init__(self, cfg: Dict[str, Any], pt_paths: Optional[Sequence[str]] = None):
+        super().__init__()
+        data_cfg = cfg.get("data", {}) or {}
+        feat_cfg = cfg.get("features", {}) or {}
+
+        if pt_paths is None:
+            pt_path = str(data_cfg.get("pt_path", "")).strip()
+            if not pt_path:
+                raise ValueError("cfg['data']['pt_path'] is required.")
+            pt_paths = [pt_path]
+        pt_paths = [os.path.expanduser(str(p)) for p in pt_paths]
+        if len(pt_paths) == 0:
+            raise ValueError("PointGraphWindowDataset requires at least one PT path.")
+
+        self.window_size = int(data_cfg.get("window_size", 2))
+        self.stride = int(data_cfg.get("stride", 1))
+        if self.window_size < 2:
+            raise ValueError("data.window_size must be >= 2.")
+        if self.stride < 1:
+            raise ValueError("data.stride must be >= 1.")
+
+        self.use_y_target = bool(data_cfg.get("use_y_as_target", True))
+        split_by_z = bool(data_cfg.get("split_by_z", False))
+        z_index = int(data_cfg.get("z_index", 2))
+        z_tol = float(data_cfg.get("z_tol", 0.0))
+
+        x_cols = feat_cfg.get("use_columns", None)
+        y_cols = feat_cfg.get("target_columns", None)
+        pos_cols = feat_cfg.get("pos_columns", None)
+        x_cols = None if x_cols is None else [int(c) for c in x_cols]
+        y_cols = x_cols if y_cols is None else [int(c) for c in y_cols]
+        pos_cols = None if pos_cols is None else [int(c) for c in pos_cols]
+
+        # One sequence per z-group when split_by_z=true; otherwise one global sequence.
+        sequences: List[List[Dict[str, Any]]] = []
+        for src_idx, src_path in enumerate(pt_paths):
+            raw_obj = _load_pt_or_zip(src_path)
+            raw_steps = _extract_series(raw_obj)
+            if len(raw_steps) < self.window_size:
+                raise ValueError(
+                    f"Need at least window_size={self.window_size} timesteps, found {len(raw_steps)} "
+                    f"(source={src_path})."
+                )
+            steps = [_extract_step_fields(s) for s in raw_steps]
+
+            src_sequences: Optional[List[List[Dict[str, Any]]]] = None
+            for t, s in enumerate(steps):
+                x_sel = _select_columns(s["x"], x_cols)
+                y_sel = None if s["y"] is None else _select_columns(s["y"], y_cols)
+                pos_sel = _select_columns(s["pos"], pos_cols)
+                ei = s["edge_index"]
+
+                if split_by_z:
+                    if z_index < 0 or z_index >= s["pos"].size(1):
+                        raise ValueError(
+                            f"split_by_z requested with z_index={z_index}, but pos has shape {tuple(s['pos'].shape)} "
+                            f"(source={src_path})"
+                        )
+                    z = s["pos"][:, z_index]
+                    groups = _build_z_groups(z, z_tol=z_tol)
+                    if len(groups) == 0:
+                        raise RuntimeError(f"No z groups found at timestep t={t} (source={src_path}).")
+                    if src_sequences is None:
+                        src_sequences = [[] for _ in range(len(groups))]
+                    if len(groups) != len(src_sequences):
+                        raise RuntimeError(
+                            f"split_by_z produced inconsistent group count at t={t}: "
+                            f"expected {len(src_sequences)}, got {len(groups)} "
+                            f"(source={src_path})."
+                        )
+                    for gidx, keep in enumerate(groups):
+                        xs, ys, ps, eis = _subgraph_by_index(x_sel, y_sel, pos_sel, ei, keep)
+                        if xs.size(0) == 0:
+                            raise RuntimeError(f"Empty z-group at t={t}, group={gidx} (source={src_path}).")
+                        if ys is not None and ys.size(0) != xs.size(0):
+                            raise RuntimeError(
+                                f"Node mismatch at t={t}, group={gidx}: x has {xs.size(0)}, y has {ys.size(0)} "
+                                f"(source={src_path})."
+                            )
+                        src_sequences[gidx].append(
+                            {
+                                "x": xs,
+                                "y": ys,
+                                "pos": ps,
+                                "edge_index": eis,
+                                "time": s["time"],
+                                "meta": {
+                                    "t": t,
+                                    "z_group": gidx,
+                                    "source_index": src_idx,
+                                    "source_path": os.path.abspath(src_path),
+                                },
+                            }
+                        )
+                else:
+                    if src_sequences is None:
+                        src_sequences = [[]]
+                    if y_sel is not None and y_sel.size(0) != x_sel.size(0):
+                        raise RuntimeError(
+                            f"Node mismatch at t={t}: x has {x_sel.size(0)}, y has {y_sel.size(0)} "
+                            f"(source={src_path})."
+                        )
+                    src_sequences[0].append(
+                        {
+                            "x": x_sel,
+                            "y": y_sel,
+                            "pos": pos_sel,
+                            "edge_index": ei,
+                            "time": s["time"],
+                            "meta": {
+                                "t": t,
+                                "source_index": src_idx,
+                                "source_path": os.path.abspath(src_path),
+                            },
+                        }
+                    )
+
+            if src_sequences is None:
+                raise RuntimeError(f"No sequences were built from source file: {src_path}")
+            sequences.extend(src_sequences)
+
+        windows: List[Tuple[int, int]] = []
+        for seq_id, seq in enumerate(sequences):
+            if len(seq) < self.window_size:
+                continue
+            for start in range(0, len(seq) - self.window_size + 1, self.stride):
+                windows.append((seq_id, start))
+
+        if len(windows) == 0:
+            raise RuntimeError(
+                f"No windows built: window_size={self.window_size}, stride={self.stride}, "
+                f"sequence_lengths={[len(s) for s in sequences]}"
+            )
+
+        self.sequences = sequences
+        self.windows = windows
+
+        ex0 = self[0]
+        self.x_dim = int(ex0["x_list"][0].size(1))
+        self.y_dim = int(ex0["y_list"][0].size(1))
+        self.pos_dim = int(ex0["pos_list"][0].size(1))
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        seq_id, start = self.windows[idx]
+        seq = self.sequences[seq_id]
+        chunk = seq[start : start + self.window_size]
+
+        x_list = [s["x"] for s in chunk]
+        pos_list = [s["pos"] for s in chunk]
+        edge_index_list = [s["edge_index"] for s in chunk]
+        t_list = [s["time"] for s in chunk]
+
+        y_list: List[torch.Tensor] = []
+        for k in range(self.window_size - 1):
+            s = chunk[k]
+            s_next = chunk[k + 1]
+            if self.use_y_target and (s["y"] is not None):
+                y_tgt = s["y"]
+            else:
+                y_tgt = s_next["x"]
+            if x_list[k].size(0) != y_tgt.size(0):
+                raise RuntimeError(
+                    f"Node mismatch in window idx={idx}, step={k}: "
+                    f"x has {x_list[k].size(0)}, target has {y_tgt.size(0)}."
+                )
+            y_list.append(y_tgt)
+
+        out = {
+            "x_list": x_list,
+            "y_list": y_list,
+            "pos_list": pos_list,
+            "edge_index_list": edge_index_list,
+            "t_list": t_list,
+            "meta": {
+                "seq_id": seq_id,
+                "start_t": start,
+                "window_size": self.window_size,
+                "step_meta": [s.get("meta", {}) for s in chunk],
+            },
+            # Back-compat convenience for one-step paths.
+            "x": x_list[0],
+            "y": y_list[0],
+            "pos": pos_list[0],
+            "edge_index": edge_index_list[0],
+            "t_src": t_list[0],
+            "t_dst": t_list[1] if len(t_list) > 1 else None,
+        }
+        return out
+
+
+def _build_dataset_for_mode(
+    cfg: Dict[str, Any],
+    *,
+    use_window_mode: bool,
+    pt_paths: Optional[Sequence[str]] = None,
+) -> Dataset:
+    if use_window_mode:
+        return PointGraphWindowDataset(cfg, pt_paths=pt_paths)
+    return PointGraphTemporalDataset(cfg, pt_paths=pt_paths)
+
+
+def _assert_dataset_dims_match(ref_ds: Dataset, other_ds: Dataset, label: str) -> None:
+    req = ("x_dim", "y_dim", "pos_dim")
+    for k in req:
+        if not hasattr(ref_ds, k) or not hasattr(other_ds, k):
+            raise AttributeError(f"Dataset objects must expose '{k}' for split compatibility checks.")
+    ref_dims = (int(getattr(ref_ds, "x_dim")), int(getattr(ref_ds, "y_dim")), int(getattr(ref_ds, "pos_dim")))
+    oth_dims = (int(getattr(other_ds, "x_dim")), int(getattr(other_ds, "y_dim")), int(getattr(other_ds, "pos_dim")))
+    if ref_dims != oth_dims:
+        raise ValueError(
+            f"Dataset dimension mismatch for split '{label}': ref(train) dims={ref_dims}, split dims={oth_dims}."
+        )
+
+
+def _collate_one(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(batch) != 1:
+        raise RuntimeError(
+            "This baseline trainer currently supports batch_size=1 only "
+            "(variable-size graph samples)."
+        )
+    return batch[0]
+
+
+@dataclass
+class NormStats:
+    x_mu: Optional[torch.Tensor]
+    x_std: Optional[torch.Tensor]
+    y_mu: Optional[torch.Tensor]
+    y_std: Optional[torch.Tensor]
+
+
+@torch.no_grad()
+def _compute_norm_stats(
+    dataset: Dataset,
+    indices: Sequence[int],
+    device: torch.device,
+    *,
+    rollout_steps: Optional[int] = None,
+) -> NormStats:
+    x_sum = None
+    x_sq_sum = None
+    y_sum = None
+    y_sq_sum = None
+    n_x = 0
+    n_y = 0
+
+    def _accum_xy(x_raw: torch.Tensor, y_raw: torch.Tensor) -> None:
+        nonlocal x_sum, x_sq_sum, y_sum, y_sq_sum, n_x, n_y
+        x = x_raw.to(device=device, dtype=torch.float32)
+        y = y_raw.to(device=device, dtype=torch.float32)
+        if x_sum is None:
+            x_sum = x.sum(dim=0)
+            x_sq_sum = (x * x).sum(dim=0)
+        else:
+            x_sum += x.sum(dim=0)
+            x_sq_sum += (x * x).sum(dim=0)
+        n_x += int(x.size(0))
+
+        if y_sum is None:
+            y_sum = y.sum(dim=0)
+            y_sq_sum = (y * y).sum(dim=0)
+        else:
+            y_sum += y.sum(dim=0)
+            y_sq_sum += (y * y).sum(dim=0)
+        n_y += int(y.size(0))
+
+    for idx in indices:
+        ex = dataset[int(idx)]
+        if ("x" in ex) and ("y" in ex) and torch.is_tensor(ex["x"]) and torch.is_tensor(ex["y"]):
+            _accum_xy(ex["x"], ex["y"])
+            continue
+
+        x_list = ex.get("x_list", None)
+        y_list = ex.get("y_list", None)
+        if isinstance(x_list, list) and isinstance(y_list, list) and len(y_list) > 0:
+            use_steps = len(y_list)
+            if rollout_steps is not None:
+                use_steps = min(use_steps, max(1, int(rollout_steps)))
+            for k in range(use_steps):
+                _accum_xy(x_list[k], y_list[k])
+            continue
+
+        raise KeyError("Dataset example must provide x/y tensors or x_list/y_list tensors.")
+
+    if x_sum is None or y_sum is None or n_x == 0 or n_y == 0:
+        return NormStats(None, None, None, None)
+
+    x_mu = x_sum / float(n_x)
+    y_mu = y_sum / float(n_y)
+    x_var = (x_sq_sum / float(n_x)) - (x_mu * x_mu)
+    y_var = (y_sq_sum / float(n_y)) - (y_mu * y_mu)
+    x_std = torch.sqrt(torch.clamp(x_var, min=1e-12))
+    y_std = torch.sqrt(torch.clamp(y_var, min=1e-12))
+    return NormStats(x_mu, x_std, y_mu, y_std)
+
+
+def _maybe_norm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[torch.Tensor]) -> torch.Tensor:
+    if mu is None or std is None:
+        return x
+    return (x - mu.to(device=x.device, dtype=x.dtype)) / std.to(device=x.device, dtype=x.dtype).clamp_min(1e-12)
+
+
+def _maybe_denorm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[torch.Tensor]) -> torch.Tensor:
+    if mu is None or std is None:
+        return x
+    mu_ = mu.to(device=x.device, dtype=x.dtype)
+    std_ = std.to(device=x.device, dtype=x.dtype).clamp_min(1e-12)
+    return x * std_ + mu_
+
+
+def _build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int, device: torch.device) -> FeatureNet:
+    mcfg = cfg.get("model", {}) or {}
+    model = FeatureNet(
+        in_channels=in_dim,
+        out_channels=out_dim,
+        hidden=int(mcfg.get("hidden", 128)),
+        layers=int(mcfg.get("layers", 3)),
+        dropout=float(mcfg.get("dropout", 0.1)),
+        make_score_head=False,
+    ).to(device)
+    return model
+
+
+def _run_epoch(
+    model: FeatureNet,
+    loader: DataLoader,
+    optimizer: Optional[optim.Optimizer],
+    *,
+    device: torch.device,
+    include_pos: bool,
+    norm: NormStats,
+    use_huber: bool,
+    huber_delta: float,
+    grad_clip: float,
+) -> Tuple[float, float]:
+    train_mode = optimizer is not None
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+
+    loss_sum = 0.0
+    mae_sum = 0.0
+    n = 0
+
+    for batch in loader:
+        x = batch["x"].to(device=device, dtype=torch.float32)
+        y = batch["y"].to(device=device, dtype=torch.float32)
+        pos = batch["pos"].to(device=device, dtype=torch.float32)
+        ei = batch["edge_index"].to(device=device, dtype=torch.long)
+
+        x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
+        y_tgt = _maybe_norm(y, norm.y_mu, norm.y_std)
+
+        if include_pos:
+            x_model = torch.cat([x_in, pos], dim=1)
+        else:
+            x_model = x_in
+
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+
+        y_pred_norm, _score, _h = model(x_model, ei)
+        if use_huber:
+            loss = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
+        else:
+            loss = F.mse_loss(y_pred_norm, y_tgt)
+
+        if train_mode:
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+            optimizer.step()
+
+        with torch.no_grad():
+            y_pred = _maybe_denorm(y_pred_norm, norm.y_mu, norm.y_std)
+            mae = (y_pred - y).abs().mean()
+
+        loss_sum += float(loss.detach().cpu().item())
+        mae_sum += float(mae.detach().cpu().item())
+        n += 1
+
+    if n == 0:
+        return float("nan"), float("nan")
+    return loss_sum / n, mae_sum / n
+
+
+def _run_epoch_multi_step(
+    model: FeatureNet,
+    loader: DataLoader,
+    optimizer: Optional[optim.Optimizer],
+    *,
+    device: torch.device,
+    include_pos: bool,
+    norm: NormStats,
+    use_huber: bool,
+    huber_delta: float,
+    grad_clip: float,
+    rollout_steps: int,
+    autoregressive: bool,
+) -> Tuple[float, float, Dict[str, int]]:
+    train_mode = optimizer is not None
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    total_mae = 0.0
+    n_steps = 0
+    n_windows = 0
+
+    warned_input_shape = False
+    warned_chain_shape = False
+
+    for batch in loader:
+        x_list = batch.get("x_list", None)
+        y_list = batch.get("y_list", None)
+        pos_list = batch.get("pos_list", None)
+        edge_index_list = batch.get("edge_index_list", None)
+        if not isinstance(x_list, list) or not isinstance(y_list, list):
+            raise RuntimeError("Multi-step mode requires batch keys: x_list, y_list, pos_list, edge_index_list.")
+
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+
+        max_roll = min(int(rollout_steps), len(y_list), max(0, len(x_list) - 1))
+        if max_roll < 1:
+            raise RuntimeError("Window has no transitions to train on; check window_size and rollout_steps.")
+
+        window_loss_graph = None
+        x_roll_abs: Optional[torch.Tensor] = None
+
+        for k in range(max_roll):
+            x_teacher = x_list[k].to(device=device, dtype=torch.float32)
+            y_tgt_abs = y_list[k].to(device=device, dtype=torch.float32)
+            pos = pos_list[k].to(device=device, dtype=torch.float32)
+            ei = edge_index_list[k].to(device=device, dtype=torch.long)
+
+            # Shock-ramp style chaining: model output at k feeds input at k+1.
+            if autoregressive and (k > 0) and (x_roll_abs is not None):
+                x_in_abs = x_roll_abs
+            else:
+                x_in_abs = x_teacher
+
+            # Fallback to teacher if an autoregressive shape mismatch appears.
+            if x_in_abs.shape != x_teacher.shape:
+                if autoregressive and (not warned_input_shape):
+                    print(
+                        "[WARN] Autoregressive input shape mismatch; falling back to teacher input for that step. "
+                        "This usually means node ordering/count differs across timesteps."
+                    )
+                    warned_input_shape = True
+                x_in_abs = x_teacher
+
+            if x_in_abs.size(0) != pos.size(0) or x_in_abs.size(0) != y_tgt_abs.size(0):
+                if autoregressive and (x_teacher.size(0) == pos.size(0) == y_tgt_abs.size(0)):
+                    if not warned_input_shape:
+                        print(
+                            "[WARN] Autoregressive node-count mismatch; using teacher input for that step."
+                        )
+                        warned_input_shape = True
+                    x_in_abs = x_teacher
+                else:
+                    raise RuntimeError(
+                        f"Node mismatch at step k={k}: input={x_in_abs.size(0)} "
+                        f"pos={pos.size(0)} target={y_tgt_abs.size(0)}"
+                    )
+
+            x_in = _maybe_norm(x_in_abs, norm.x_mu, norm.x_std)
+            y_tgt = _maybe_norm(y_tgt_abs, norm.y_mu, norm.y_std)
+            x_model = torch.cat([x_in, pos], dim=1) if include_pos else x_in
+
+            with torch.set_grad_enabled(train_mode):
+                y_pred_norm, _score, _h = model(x_model, ei)
+                if use_huber:
+                    loss_k = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
+                else:
+                    loss_k = F.mse_loss(y_pred_norm, y_tgt)
+
+            if train_mode:
+                window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
+
+            with torch.no_grad():
+                y_pred_abs = _maybe_denorm(y_pred_norm.detach(), norm.y_mu, norm.y_std)
+                mae_k = float((y_pred_abs - y_tgt_abs).abs().mean().cpu().item())
+
+            total_loss += float(loss_k.detach().cpu().item())
+            total_mae += mae_k
+            n_steps += 1
+
+            # Chain predicted state forward when shapes allow it.
+            if autoregressive and (k + 1 < max_roll):
+                next_teacher = x_list[k + 1]
+                if y_pred_abs.shape == next_teacher.shape:
+                    x_roll_abs = y_pred_abs.detach()
+                else:
+                    if not warned_chain_shape:
+                        print(
+                            f"[WARN] Cannot chain prediction at step k={k}: "
+                            f"pred shape {tuple(y_pred_abs.shape)} != next input shape {tuple(next_teacher.shape)}. "
+                            "Using teacher input for following step."
+                        )
+                        warned_chain_shape = True
+                    x_roll_abs = None
+            else:
+                x_roll_abs = None
+
+        if train_mode:
+            if window_loss_graph is not None:
+                window_loss_graph.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+            optimizer.step()
+
+        n_windows += 1
+
+    denom = max(1, n_steps)
+    return total_loss / denom, total_mae / denom, {"num_windows": n_windows, "num_steps": n_steps}
+
+
+def main(config_path: str) -> None:
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    cfg_raw = copy.deepcopy(cfg)
+
+    seed = int(cfg.get("seed", 1337))
+    set_seed(seed)
+
+    device = torch.device(str(cfg.get("device", "cpu")))
+
+    data_cfg = cfg.get("data", {}) or {}
+    train_cfg = cfg.get("train", {}) or {}
+    split_cfg = cfg.get("split", {}) or {}
+    feat_cfg = cfg.get("features", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+
+    window_size = int(data_cfg.get("window_size", 2))
+    stride = int(data_cfg.get("stride", 1))
+    multi_step_k = int(train_cfg.get("multi_step_K", max(1, window_size - 1)))
+    multi_step_autoreg = bool(train_cfg.get("autoregressive", True))
+    use_window_mode = (window_size > 2) or (multi_step_k > 1)
+    f_train = float(split_cfg.get("train", 0.8))
+    f_val = float(split_cfg.get("val", 0.1))
+
+    pt_source = _resolve_pt_source(str(data_cfg.get("pt_path", "")).strip())
+    source_mode = str(pt_source.get("mode", "single_file"))
+    use_pre_split_dirs = (source_mode == "pre_split_dir")
+    if use_pre_split_dirs:
+        print("[INFO] detected pre-split data directory; cfg.split train/val fractions will be ignored.")
+
+    if use_window_mode:
+        rollout_steps = min(max(1, multi_step_k), window_size - 1)
+        if bool(data_cfg.get("use_y_as_target", True)):
+            print(
+                "[WARN] data.use_y_as_target=true with autoregressive multi-step training. "
+                "This is only semantically correct if y_t is the next-state target."
+            )
+    else:
+        rollout_steps = 1
+        multi_step_autoreg = False
+
+    include_pos = bool(feat_cfg.get("include_pos", True))
+    normalize = bool(feat_cfg.get("normalize", True))
+    use_huber = bool(loss_cfg.get("use_huber", False))
+    huber_delta = float(loss_cfg.get("huber_delta", 0.05))
+    grad_clip = float(train_cfg.get("grad_clip", 0.0))
+
+    save_dir = os.path.expanduser(str(train_cfg.get("save_dir", "./runs_basic_point")))
+    os.makedirs(save_dir, exist_ok=True)
+
+    split_files: Optional[Dict[str, List[str]]] = None
+    source_file: Optional[str] = None
+    if use_pre_split_dirs:
+        split_files = pt_source.get("split_files", None)
+        if not isinstance(split_files, dict):
+            raise RuntimeError("pt source resolution failed for pre-split directory mode.")
+        train_ds = _build_dataset_for_mode(cfg, use_window_mode=use_window_mode, pt_paths=split_files["train"])
+        val_ds = _build_dataset_for_mode(cfg, use_window_mode=use_window_mode, pt_paths=split_files["val"])
+        test_ds = _build_dataset_for_mode(cfg, use_window_mode=use_window_mode, pt_paths=split_files["test"])
+        _assert_dataset_dims_match(train_ds, val_ds, label="val")
+        _assert_dataset_dims_match(train_ds, test_ds, label="test")
+        dataset_for_dims = train_ds
+        n_total = len(train_ds) + len(val_ds) + len(test_ds)
+        norm_dataset = train_ds
+        norm_indices = np.arange(len(train_ds), dtype=np.int64)
+    else:
+        source_file = str(pt_source.get("path", ""))
+        dataset = _build_dataset_for_mode(cfg, use_window_mode=use_window_mode)
+        dataset_for_dims = dataset
+        n_total = len(dataset)
+        idxs = np.arange(n_total)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(idxs)
+
+        n_train = int(round(f_train * n_total))
+        n_val = int(round(f_val * n_total))
+        n_train = max(1, min(n_train, n_total - 1))
+        n_val = max(1, min(n_val, n_total - n_train))
+
+        train_idx = idxs[:n_train]
+        val_idx = idxs[n_train : n_train + n_val]
+        test_idx = idxs[n_train + n_val :]
+        if len(test_idx) == 0:
+            test_idx = val_idx[:1]
+
+        train_ds = Subset(dataset, train_idx.tolist())
+        val_ds = Subset(dataset, val_idx.tolist())
+        test_ds = Subset(dataset, test_idx.tolist())
+        norm_dataset = dataset
+        norm_indices = train_idx
+
+    batch_size = int(train_cfg.get("batch_size", 1))
+    if batch_size != 1:
+        raise ValueError("train_basic_point.py currently requires train.batch_size=1.")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=1,
+        sampler=RandomSampler(train_ds),
+        num_workers=int(cfg.get("data", {}).get("num_workers", 0)),
+        pin_memory=False,
+        collate_fn=_collate_one,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        sampler=RandomSampler(val_ds),
+        num_workers=int(cfg.get("data", {}).get("num_workers", 0)),
+        pin_memory=False,
+        collate_fn=_collate_one,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=1,
+        sampler=RandomSampler(test_ds),
+        num_workers=int(cfg.get("data", {}).get("num_workers", 0)),
+        pin_memory=False,
+        collate_fn=_collate_one,
+    )
+
+    # Normalization stats from train split.
+    if normalize:
+        stats = _compute_norm_stats(
+            norm_dataset,
+            norm_indices,
+            device=device,
+            rollout_steps=(rollout_steps if use_window_mode else 1),
+        )
+    else:
+        stats = NormStats(None, None, None, None)
+
+    in_dim = dataset_for_dims.x_dim + (dataset_for_dims.pos_dim if include_pos else 0)
+    out_dim = dataset_for_dims.y_dim
+    model = _build_model(cfg, in_dim=in_dim, out_dim=out_dim, device=device)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=float(train_cfg.get("lr", 1e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
+    )
+
+    epochs = int(train_cfg.get("epochs", 50))
+    val_every = int(train_cfg.get("validation_every_epochs", 1))
+    val_every = max(1, val_every)
+
+    best_val = float("inf")
+    best_path = os.path.join(save_dir, "best_model.pt")
+    final_path = os.path.join(save_dir, "final_model.pt")
+    log_path = os.path.join(save_dir, "train_log.csv")
+
+    with open(log_path, "w") as f:
+        f.write("epoch,split,loss,mae\n")
+
+    if use_pre_split_dirs:
+        n_train_files = len(split_files["train"]) if split_files is not None else 0
+        n_val_files = len(split_files["val"]) if split_files is not None else 0
+        n_test_files = len(split_files["test"]) if split_files is not None else 0
+        if use_window_mode:
+            print(
+                f"[INFO] dataset windows={n_total} "
+                f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
+                f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
+                f"autoregressive={multi_step_autoreg}"
+            )
+        else:
+            print(
+                f"[INFO] dataset pairs={n_total} "
+                f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
+                f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim}"
+            )
+    else:
+        if use_window_mode:
+            print(
+                f"[INFO] dataset windows={n_total} "
+                f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
+                f"autoregressive={multi_step_autoreg}"
+            )
+        else:
+            print(
+                f"[INFO] dataset pairs={n_total} "
+                f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim}"
+            )
+    if normalize and stats.x_mu is not None:
+        print("[INFO] normalization enabled (train split stats computed).")
+    else:
+        print("[INFO] normalization disabled.")
+
+    for ep in range(1, epochs + 1):
+        ep_t0 = time.perf_counter()
+        if use_window_mode:
+            tr_loss, tr_mae, _tr_stats = _run_epoch_multi_step(
+                model,
+                train_loader,
+                optimizer,
+                device=device,
+                include_pos=include_pos,
+                norm=stats,
+                use_huber=use_huber,
+                huber_delta=huber_delta,
+                grad_clip=grad_clip,
+                rollout_steps=rollout_steps,
+                autoregressive=multi_step_autoreg,
+            )
+        else:
+            tr_loss, tr_mae = _run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device=device,
+                include_pos=include_pos,
+                norm=stats,
+                use_huber=use_huber,
+                huber_delta=huber_delta,
+                grad_clip=grad_clip,
+            )
+
+        run_val = (ep % val_every == 0) or (ep == epochs)
+        if run_val:
+            if use_window_mode:
+                va_loss, va_mae, _va_stats = _run_epoch_multi_step(
+                    model,
+                    val_loader,
+                    None,
+                    device=device,
+                    include_pos=include_pos,
+                    norm=stats,
+                    use_huber=use_huber,
+                    huber_delta=huber_delta,
+                    grad_clip=0.0,
+                    rollout_steps=rollout_steps,
+                    autoregressive=multi_step_autoreg,
+                )
+            else:
+                va_loss, va_mae = _run_epoch(
+                    model,
+                    val_loader,
+                    None,
+                    device=device,
+                    include_pos=include_pos,
+                    norm=stats,
+                    use_huber=use_huber,
+                    huber_delta=huber_delta,
+                    grad_clip=0.0,
+                )
+            if va_loss < best_val:
+                best_val = va_loss
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "cfg": cfg,
+                        "norm": {
+                            "x_mu": None if stats.x_mu is None else stats.x_mu.detach().cpu(),
+                            "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
+                            "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
+                            "y_std": None if stats.y_std is None else stats.y_std.detach().cpu(),
+                        },
+                        "dims": {"in_dim": in_dim, "out_dim": out_dim},
+                    },
+                    best_path,
+                )
+        else:
+            va_loss, va_mae = float("nan"), float("nan")
+
+        with open(log_path, "a") as f:
+            f.write(f"{ep},train,{tr_loss:.10f},{tr_mae:.10f}\n")
+            if run_val:
+                f.write(f"{ep},val,{va_loss:.10f},{va_mae:.10f}\n")
+
+        ep_s = time.perf_counter() - ep_t0
+        if run_val:
+            print(
+                f"[E{ep:04d}] "
+                f"train loss={tr_loss:.6f} mae={tr_mae:.6f} | "
+                f"val loss={va_loss:.6f} mae={va_mae:.6f} | "
+                f"epoch_time={ep_s:.2f}s"
+            )
+        else:
+            print(
+                f"[E{ep:04d}] train loss={tr_loss:.6f} mae={tr_mae:.6f} | "
+                f"epoch_time={ep_s:.2f}s"
+            )
+
+    # Final + test.
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "cfg": cfg,
+            "norm": {
+                "x_mu": None if stats.x_mu is None else stats.x_mu.detach().cpu(),
+                "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
+                "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
+                "y_std": None if stats.y_std is None else stats.y_std.detach().cpu(),
+            },
+            "dims": {"in_dim": in_dim, "out_dim": out_dim},
+        },
+        final_path,
+    )
+
+    # Evaluate best checkpoint if available.
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+    if use_window_mode:
+        te_loss, te_mae, _te_stats = _run_epoch_multi_step(
+            model,
+            test_loader,
+            None,
+            device=device,
+            include_pos=include_pos,
+            norm=stats,
+            use_huber=use_huber,
+            huber_delta=huber_delta,
+            grad_clip=0.0,
+            rollout_steps=rollout_steps,
+            autoregressive=multi_step_autoreg,
+        )
+    else:
+        te_loss, te_mae = _run_epoch(
+            model,
+            test_loader,
+            None,
+            device=device,
+            include_pos=include_pos,
+            norm=stats,
+            use_huber=use_huber,
+            huber_delta=huber_delta,
+            grad_clip=0.0,
+        )
+
+    split_file_paths = (
+        {k: [os.path.abspath(p) for p in v] for k, v in split_files.items()}
+        if split_files is not None
+        else None
+    )
+    summary = {
+        "config_path": os.path.abspath(os.path.expanduser(config_path)),
+        "config_raw": cfg_raw,
+        "config_effective": {
+            "seed": int(seed),
+            "device": str(device),
+            "data": {
+                "pt_path": str(data_cfg.get("pt_path", "")),
+                "source_mode": source_mode,
+                "source_file": (None if source_file is None else os.path.abspath(source_file)),
+                "source_root": (
+                    None
+                    if not use_pre_split_dirs
+                    else os.path.abspath(str(pt_source.get("root", data_cfg.get("pt_path", ""))))
+                ),
+                "split_file_counts": (
+                    None if split_files is None else {k: len(v) for k, v in split_files.items()}
+                ),
+                "num_workers": int(data_cfg.get("num_workers", 0)),
+                "window_size": int(window_size),
+                "stride": int(stride),
+                "use_y_as_target": bool(data_cfg.get("use_y_as_target", True)),
+                "use_y_for_input": bool(data_cfg.get("use_y_for_input", False)),
+                "x_input_columns": data_cfg.get("x_input_columns", None),
+                "target_columns": data_cfg.get("target_columns", None),
+                "split_by_z": bool(data_cfg.get("split_by_z", False)),
+                "z_index": data_cfg.get("z_index", None),
+                "z_tol": float(data_cfg.get("z_tol", 0.0)),
+            },
+            "split": {
+                "train": float(f_train),
+                "val": float(f_val),
+            },
+            "features": {
+                "include_pos": bool(include_pos),
+                "normalize": bool(normalize),
+            },
+            "loss": {
+                "use_huber": bool(use_huber),
+                "huber_delta": float(huber_delta),
+            },
+            "train": {
+                "save_dir": str(save_dir),
+                "batch_size": int(batch_size),
+                "epochs": int(epochs),
+                "validation_every_epochs": int(val_every),
+                "lr": float(train_cfg.get("lr", 1e-3)),
+                "weight_decay": float(train_cfg.get("weight_decay", 0.0)),
+                "grad_clip": float(grad_clip),
+                "multi_step_K": int(multi_step_k),
+                "autoregressive": bool(multi_step_autoreg),
+            },
+            "model": {
+                "hidden": int((cfg.get("model", {}) or {}).get("hidden", 128)),
+                "layers": int((cfg.get("model", {}) or {}).get("layers", 3)),
+                "dropout": float((cfg.get("model", {}) or {}).get("dropout", 0.1)),
+            },
+            "derived": {
+                "dataset_mode": "window" if use_window_mode else "pair",
+                "rollout_steps": int(rollout_steps),
+                "split_mode": ("pre_split_dir" if use_pre_split_dirs else "random_split"),
+            },
+        },
+        "data_source_mode": source_mode,
+        "data_source_file": (None if source_file is None else os.path.abspath(source_file)),
+        "data_source_root": (
+            None if not use_pre_split_dirs else os.path.abspath(str(pt_source.get("root", data_cfg.get("pt_path", ""))))
+        ),
+        "data_source_split_files": split_file_paths,
+        "dataset_mode": "window" if use_window_mode else "pair",
+        "dataset_samples": int(n_total),
+        "dataset_pairs": (None if use_window_mode else int(n_total)),
+        "dataset_windows": (int(n_total) if use_window_mode else None),
+        "window": {
+            "window_size": int(window_size),
+            "stride": int(stride),
+            "rollout_steps": int(rollout_steps),
+            "autoregressive": bool(multi_step_autoreg),
+        },
+        "splits": {"train": len(train_ds), "val": len(val_ds), "test": len(test_ds)},
+        "dims": {"x_dim": dataset_for_dims.x_dim, "y_dim": dataset_for_dims.y_dim, "pos_dim": dataset_for_dims.pos_dim},
+        "best_val_loss": best_val,
+        "test_loss": te_loss,
+        "test_mae": te_mae,
+        "best_checkpoint": best_path,
+        "final_checkpoint": final_path,
+        "log_csv": log_path,
+    }
+    with open(os.path.join(save_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(save_dir, "config_raw.json"), "w") as f:
+        json.dump(cfg_raw, f, indent=2)
+    with open(os.path.join(save_dir, "config_effective.json"), "w") as f:
+        json.dump(summary["config_effective"], f, indent=2)
+
+    print(f"[DONE] test loss={te_loss:.6f} mae={te_mae:.6f}")
+    print(f"[DONE] artifacts saved in: {save_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default=os.path.join(os.path.dirname(__file__), "config_karman_basic.json"),
+        help="Path to JSON config file.",
+    )
+    args = parser.parse_args()
+    main(args.config)
