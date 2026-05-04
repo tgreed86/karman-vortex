@@ -191,6 +191,134 @@ def _resolve_pt_source(pt_path: str) -> Dict[str, Any]:
     return {"mode": "pre_split_dir", "root": p, "split_files": split_files}
 
 
+def _coerce_time_series_to_tnf(x3: torch.Tensor, n_nodes: int, name: str) -> torch.Tensor:
+    """
+    Coerce a 3D tensor into [T, N, F] using node-count heuristics.
+    Accepts common layouts: [T,N,F], [N,T,F], [T,F,N].
+    """
+    if x3.ndim != 3:
+        raise ValueError(f"{name} must be 3D, got shape {tuple(x3.shape)}")
+    if x3.size(1) == n_nodes:
+        return x3
+    if x3.size(0) == n_nodes:
+        return x3.permute(1, 0, 2).contiguous()
+    if x3.size(2) == n_nodes:
+        return x3.permute(0, 2, 1).contiguous()
+    raise ValueError(
+        f"Could not align {name} to [T,N,F] with N={n_nodes}; got shape {tuple(x3.shape)}."
+    )
+
+
+def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Handle case-level tensors format, e.g.:
+      pos: [N,2], edge_index: [2,E], velocity: [T,N,2], time_steps: [T]
+    Returns per-step dict list compatible with _extract_step_fields, or None if
+    this format is not detected.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    pos_raw = obj.get("pos", None)
+    pos_phys_raw = obj.get("pos_physical", None)
+    edge_raw = obj.get("edge_index", obj.get("ei", None))
+    if edge_raw is None:
+        return None
+
+    x_key = None
+    x_raw = None
+    for k in (
+        "velocity",
+        "x",
+        "features",
+        "feature_series",
+        "x_series",
+        "state_series",
+        "states",
+    ):
+        v = obj.get(k, None)
+        if v is None:
+            continue
+        t = torch.as_tensor(v)
+        if t.ndim == 3:
+            x_key = k
+            x_raw = v
+            break
+    if x_raw is None:
+        return None
+
+    if pos_raw is None and pos_phys_raw is None:
+        return None
+    if pos_raw is None:
+        pos_raw = pos_phys_raw
+
+    pos = _as_2d_float(pos_raw, "pos")
+    edge_index = _as_edge_index(edge_raw)
+    n_nodes = int(pos.size(0))
+
+    x_tnf = _coerce_time_series_to_tnf(torch.as_tensor(x_raw, dtype=torch.float32), n_nodes, x_key)
+    T = int(x_tnf.size(0))
+
+    y_tnf = None
+    for yk in ("y", "targets", "target_series", "y_series", "labels"):
+        yv = obj.get(yk, None)
+        if yv is None:
+            continue
+        yt = torch.as_tensor(yv, dtype=torch.float32)
+        if yt.ndim != 3:
+            continue
+        y_tnf = _coerce_time_series_to_tnf(yt, n_nodes, yk)
+        if int(y_tnf.size(0)) != T:
+            raise ValueError(
+                f"Time length mismatch between {x_key} (T={T}) and {yk} (T={int(y_tnf.size(0))})."
+            )
+        break
+
+    time_vec = None
+    for tk in ("time_steps", "times", "time", "t"):
+        tv = obj.get(tk, None)
+        if tv is None:
+            continue
+        tt = torch.as_tensor(tv).view(-1)
+        if int(tt.numel()) == T:
+            time_vec = tt.to(torch.float32)
+            break
+    if time_vec is None:
+        t0 = int(obj.get("time_start", 0))
+        dt_idx = int(obj.get("time_stride", 1))
+        time_vec = torch.arange(T, dtype=torch.float32) * float(dt_idx) + float(t0)
+
+    gp_base = {
+        "case_name": obj.get("case_name", None),
+        "split_name": obj.get("split_name", None),
+        "reynolds_number": obj.get("reynolds_number", None),
+        "frame_dt_seconds": obj.get("frame_dt_seconds", None),
+        "time_stride": obj.get("time_stride", None),
+        "time_start": obj.get("time_start", None),
+        "time_end": obj.get("time_end", None),
+        "source_x_key": x_key,
+    }
+
+    print(
+        f"[INFO] detected case-level format: case={gp_base['case_name']} split={gp_base['split_name']} "
+        f"x_key={x_key} steps={T} nodes={n_nodes} feat_dim={int(x_tnf.size(2))}"
+    )
+
+    steps: List[Dict[str, Any]] = []
+    for i in range(T):
+        steps.append(
+            {
+                "x": x_tnf[i],
+                "y": (None if y_tnf is None else y_tnf[i]),
+                "pos": pos,
+                "edge_index": edge_index,
+                "time": float(time_vec[i].item()),
+                "global_params": gp_base,
+            }
+        )
+    return steps
+
+
 def _extract_series(obj: Any) -> List[Any]:
     if isinstance(obj, list):
         return obj
@@ -198,10 +326,14 @@ def _extract_series(obj: Any) -> List[Any]:
         for key in ("timesteps", "snapshots", "steps", "time_steps", "sequence", "data_list"):
             if key in obj and isinstance(obj[key], list):
                 return obj[key]
+        case_steps = _extract_case_level_series(obj)
+        if case_steps is not None:
+            return case_steps
     # Single timestep object is not enough for temporal training.
     raise ValueError(
         "Could not find a list of timesteps in loaded object. "
-        "Expected list or dict with timesteps/snapshots/steps/sequence/data_list."
+        "Expected list or dict with timesteps/snapshots/steps/sequence/data_list, "
+        "or a case-level dict with (pos, edge_index, velocity[time,node,feature])."
     )
 
 

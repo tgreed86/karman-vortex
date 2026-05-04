@@ -3,27 +3,22 @@
   "device": "mps",
 
   "data": {
-    "pt_path": "./cache/Re_600_normalized.pt",
+    "pt_path": "./cache/Reynolds_750.pt",
     "num_workers": 0,
     "use_y_as_target": false,
     "window_size": 4,
     "stride": 1,
-    "split_by_z": true,
+    "split_by_z": false,
     "z_index": 2,
     "z_tol": 0.0
   },
 
   "features": {
-    "use_columns": [0, 1, 2, 6],
-    "target_columns": [0, 1, 2, 6],
+    "use_columns": [0, 1],
+    "target_columns": [0, 1],
     "names": [
-      "pressure",
       "velocity_x",
-      "velocity_y",
-      "velocity_z",
-      "vorticity_x",
-      "vorticity_y",
-      "vorticity_z"
+      "velocity_y"
     ],
     "normalize": true,
     "include_pos": true,
@@ -37,7 +32,7 @@
   },
 
   "train": {
-    "epochs": 100,
+    "epochs": 1,
     "validation_every_epochs": 1,
     "batch_size": 1,
     "lr": 0.0005,
@@ -45,7 +40,7 @@
     "grad_clip": 1.0,
     "multi_step_K": 2,
     "autoregressive": true,
-    "save_dir": "./runs_karman_basic"
+    "save_dir": "./runs_karman_basic/test"
   },
 
   "model": {
