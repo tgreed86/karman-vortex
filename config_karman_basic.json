@@ -3,11 +3,10 @@
   "device": "mps",
 
   "data": {
-    "pt_path": "./cache/Reynolds_750.pt",
+    "pt_path": "./cache/",
     "num_workers": 0,
     "use_y_as_target": false,
-    "window_size": 4,
-    "stride": 1,
+    "reverse_time": false,
     "split_by_z": false,
     "z_index": 2,
     "z_tol": 0.0
@@ -38,7 +37,8 @@
     "lr": 0.0005,
     "weight_decay": 0.0,
     "grad_clip": 1.0,
-    "multi_step_K": 2,
+    "window_size": 5,
+    "stride": 1,
     "autoregressive": true,
     "save_dir": "./runs_karman_basic/test"
   },
@@ -53,5 +53,34 @@
   "loss": {
     "use_huber": false,
     "huber_delta": 0.05
+  },
+
+  "physics": {
+    "physics_backend": "dec",
+    "parc_include_adv": false,
+    "parc_include_diff": false,
+    "advection_type": "scalar",
+    "velocity_channels": [0, 1],
+    "advection_scheme": "upwind",
+    "euler_flux_scheme": "rusanov",
+    "adv_weight": 1.0,
+    "diff_weight": 1.0,
+    "nu": 0.0,
+    "parc_input_form": "rate",
+    "parc_predict_type": "rate",
+    "parc_detach_inputs": true,
+    "parc_input_weighted": false,
+
+    "mls_ops_device": "cpu",
+    "mls_use_2hop_extension": true,
+    "mls_use_neighbor_damping": true,
+    "mls_damping_alpha": 0.5,
+    "mls_poly_order": 2,
+    "mls_min_neighbors": 6,
+    "mls_cache_by_geometry": false,
+
+    "rho_floor": 1e-6,
+    "rho_eps": 1e-8,
+    "u_clip": 1000.0
   }
 }

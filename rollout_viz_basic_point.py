@@ -33,6 +33,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
 import numpy as np
 import torch
 
@@ -438,6 +439,7 @@ def _scatter_panel(
     pos_np: np.ndarray,
     val_np: np.ndarray,
     *,
+    tri: Optional[mtri.Triangulation] = None,
     point_idx: np.ndarray,
     vmin: float,
     vmax: float,
@@ -445,6 +447,7 @@ def _scatter_panel(
     point_size: float,
     zoom_bbox: Optional[Tuple[float, float, float, float]],
 ):
+    _ = tri  # kept for call-signature parity with _tri_panel
     p = pos_np[point_idx]
     v = val_np[point_idx]
     sc = ax.scatter(
@@ -468,9 +471,116 @@ def _scatter_panel(
     return sc
 
 
+def _build_triangulation(
+    pos_np: np.ndarray,
+    *,
+    point_idx: np.ndarray,
+    edge_quantile: float,
+    edge_factor: float,
+) -> Optional[mtri.Triangulation]:
+    p = pos_np[point_idx]
+    if p.ndim != 2 or p.shape[0] < 3:
+        return None
+    try:
+        tri = mtri.Triangulation(p[:, 0], p[:, 1])
+    except Exception:
+        return None
+
+    tris = getattr(tri, "triangles", None)
+    if tris is None or len(tris) == 0:
+        return tri
+
+    # Mask long-edge triangles to avoid bridging across geometric voids
+    # (e.g., around the cylinder boundary) when using Delaunay interpolation.
+    pts = p[tris]  # [ntri, 3, 2]
+    e01 = np.linalg.norm(pts[:, 0, :] - pts[:, 1, :], axis=1)
+    e12 = np.linalg.norm(pts[:, 1, :] - pts[:, 2, :], axis=1)
+    e20 = np.linalg.norm(pts[:, 2, :] - pts[:, 0, :], axis=1)
+    max_edge = np.maximum(e01, np.maximum(e12, e20))
+
+    finite = np.isfinite(max_edge)
+    if np.any(finite):
+        q = float(np.clip(edge_quantile, 0.5, 0.999))
+        base = float(np.quantile(max_edge[finite], q))
+        thr = base * float(max(1.0, edge_factor))
+        mask = max_edge > thr
+    else:
+        mask = np.zeros((len(tris),), dtype=bool)
+
+    try:
+        analyzer = mtri.TriAnalyzer(tri)
+        flat_mask = analyzer.get_flat_tri_mask(min_circle_ratio=0.01)
+        if flat_mask is not None and len(flat_mask) == len(mask):
+            mask = np.logical_or(mask, flat_mask)
+    except Exception:
+        pass
+
+    if np.any(mask):
+        tri.set_mask(mask)
+    return tri
+
+
+def _tri_panel(
+    ax,
+    pos_np: np.ndarray,
+    val_np: np.ndarray,
+    *,
+    tri: Optional[mtri.Triangulation] = None,
+    point_idx: np.ndarray,
+    vmin: float,
+    vmax: float,
+    cmap: str,
+    point_size: float,
+    zoom_bbox: Optional[Tuple[float, float, float, float]],
+):
+    if tri is None:
+        return _scatter_panel(
+            ax,
+            pos_np,
+            val_np,
+            point_idx=point_idx,
+            vmin=vmin,
+            vmax=vmax,
+            cmap=cmap,
+            point_size=point_size,
+            zoom_bbox=zoom_bbox,
+        )
+
+    v = val_np[point_idx]
+    # Gouraud shading gives smooth interpolation from point values.
+    m = ax.tripcolor(
+        tri,
+        v,
+        shading="gouraud",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    if zoom_bbox is not None:
+        xmin, xmax, ymin, ymax = zoom_bbox
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return m
+
+
 def _safe_name(s: str) -> str:
     out = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in s.strip())
     return out if out else "feature"
+
+
+def _fmt_abs_time(v: Any) -> str:
+    if v is None:
+        return "NA"
+    try:
+        vv = float(v)
+        if not np.isfinite(vv):
+            return "NA"
+        return f"{vv:.6g}"
+    except Exception:
+        return "NA"
 
 
 def _enforce_gif_duration_ms(gif_path: str, duration_ms: int) -> bool:
@@ -645,9 +755,15 @@ def make_rollout_gifs(
     target_label: str,
     input_label: str,
     pred_gt_only: bool = False,
+    render_mode: str = "scatter",
+    tri_edge_quantile: float = 0.95,
+    tri_edge_factor: float = 1.75,
+    reverse_time: bool = False,
 ) -> List[str]:
     if len(examples) == 0:
         raise ValueError("No rollout examples to visualize.")
+    if render_mode not in ("scatter", "tri"):
+        raise ValueError(f"Unsupported render_mode={render_mode}; use 'scatter' or 'tri'.")
 
     os.makedirs(out_dir, exist_ok=True)
     F = int(examples[0]["gt_t"].shape[1])
@@ -719,7 +835,9 @@ def make_rollout_gifs(
         # Keep a stable plotted subset for each encountered node count.
         # This avoids per-frame "TV static" flicker when max_points < N.
         pick_cache: Dict[int, np.ndarray] = {}
-        for k, ex in enumerate(examples):
+        tri_cache: Dict[int, Optional[mtri.Triangulation]] = {}
+        frame_examples = list(reversed(examples)) if bool(reverse_time) else examples
+        for k, ex in enumerate(frame_examples):
             pos = ex["pos"].numpy()
             gt_t = ex["gt_t"].numpy()
             gt_tp1 = ex["gt_tp1"].numpy()
@@ -730,20 +848,34 @@ def make_rollout_gifs(
             n = pos.shape[0]
             if n not in pick_cache:
                 pick_cache[n] = _sample_indices(n, max_points=max_points, seed=int(sample_seed))
+            if (render_mode == "tri") and (n not in tri_cache):
+                tri_cache[n] = _build_triangulation(
+                    pos,
+                    point_idx=pick_cache[n],
+                    edge_quantile=float(tri_edge_quantile),
+                    edge_factor=float(tri_edge_factor),
+                )
             pick = pick_cache[n]
+            tri = tri_cache.get(n, None)
 
             for f in range(F):
                 if pred_gt_only:
                     fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.8), dpi=130, squeeze=False)
 
-                    sc_pred = _scatter_panel(
+                    sc_pred = (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[0, 0], pos, pred[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=float(top_min[f]), vmax=float(top_max[f]),
                         cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
                     )
-                    _scatter_panel(
+                    (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[0, 1], pos, gt_tp1[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=float(top_min[f]), vmax=float(top_max[f]),
                         cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
@@ -753,9 +885,12 @@ def make_rollout_gifs(
                     ax[0, 1].set_title("GT(t+1)")
 
                     t_abs = ex.get("t", k)
+                    t_next = ex.get("t_next", t_abs + 1)
+                    abs_time = _fmt_abs_time(ex.get("time_tp1", None))
                     mae = ex.get("mae", float("nan"))
                     fig.suptitle(
-                        f"t={t_abs}  feat={feature_names[f]}  mae={mae:.3e}  "
+                        f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                        f"feat={feature_names[f]}  mae={mae:.3e}  "
                         f"points={n} (plot {len(pick)})",
                         fontsize=11,
                     )
@@ -765,28 +900,40 @@ def make_rollout_gifs(
                 else:
                     fig, ax = plt.subplots(2, 2, figsize=(11.0, 8.2), dpi=130)
 
-                    sc00 = _scatter_panel(
+                    sc00 = (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[0, 0], pos, gt_tp1[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=float(top_min[f]), vmax=float(top_max[f]),
                         cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
                     )
-                    sc01 = _scatter_panel(
+                    (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[0, 1], pos, pred[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=float(top_min[f]), vmax=float(top_max[f]),
                         cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
                     )
 
                     dlim = float(d_abs[f])
-                    sc10 = _scatter_panel(
+                    sc10 = (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[1, 0], pos, d_gt[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=-dlim, vmax=dlim,
                         cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
                     )
-                    sc11 = _scatter_panel(
+                    (
+                        _tri_panel if render_mode == "tri" else _scatter_panel
+                    )(
                         ax[1, 1], pos, d_pg[:, f],
+                        tri=tri,
                         point_idx=pick,
                         vmin=-dlim, vmax=dlim,
                         cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
@@ -798,9 +945,12 @@ def make_rollout_gifs(
                     ax[1, 1].set_title(f"Pred-{target_label}")
 
                     t_abs = ex.get("t", k)
+                    t_next = ex.get("t_next", t_abs + 1)
+                    abs_time = _fmt_abs_time(ex.get("time_tp1", None))
                     mae = ex.get("mae", float("nan"))
                     fig.suptitle(
-                        f"t={t_abs}  feat={feature_names[f]}  mae={mae:.3e}  "
+                        f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                        f"feat={feature_names[f]}  mae={mae:.3e}  "
                         f"points={n} (plot {len(pick)})",
                         fontsize=11,
                     )
@@ -816,7 +966,7 @@ def make_rollout_gifs(
                 writers[f].append_data(buf[:, :, :3], meta={"duration": duration_s})
                 plt.close(fig)
 
-            print(f"[GIF] frame {k + 1}/{len(examples)} complete")
+            print(f"[GIF] frame {k + 1}/{len(frame_examples)} complete")
 
     finally:
         for w in writers:
@@ -855,11 +1005,34 @@ def main() -> None:
     ap.add_argument("--zoom-bbox", default=None, help="Optional zoom: xmin,xmax,ymin,ymax")
     ap.add_argument("--cmap-top", default="viridis", help="Colormap for state panels")
     ap.add_argument("--cmap-delta", default="coolwarm", help="Colormap for delta panels")
+    ap.add_argument(
+        "--render-mode",
+        default="scatter",
+        choices=("scatter", "tri"),
+        help="Panel rendering mode: point scatter or triangulated interpolation.",
+    )
+    ap.add_argument(
+        "--tri-edge-quantile",
+        type=float,
+        default=0.95,
+        help="Quantile of triangle max-edge length used as baseline for masking long triangles.",
+    )
+    ap.add_argument(
+        "--tri-edge-factor",
+        type=float,
+        default=1.75,
+        help="Multiply long-edge baseline by this factor to set triangle mask threshold.",
+    )
     ap.add_argument("--clim-sample", type=int, default=250000, help="Sample size for percentile/clim stats")
     ap.add_argument(
         "--pred-gt-only",
         action="store_true",
         help="If set, render two panels per frame: Pred(t+1) and GT(t+1).",
+    )
+    ap.add_argument(
+        "--reverse-time",
+        action="store_true",
+        help="If set, write GIF frames in reverse time order.",
     )
     args = ap.parse_args()
 
@@ -954,6 +1127,10 @@ def main() -> None:
         target_label=target_label,
         input_label=input_label,
         pred_gt_only=bool(args.pred_gt_only),
+        render_mode=str(args.render_mode),
+        tri_edge_quantile=float(args.tri_edge_quantile),
+        tri_edge_factor=float(args.tri_edge_factor),
+        reverse_time=bool(args.reverse_time),
     )
     t_gif = time.perf_counter() - t_gif0
 
@@ -972,6 +1149,10 @@ def main() -> None:
         "target_label": target_label,
         "input_label": input_label,
         "pred_gt_only": bool(args.pred_gt_only),
+        "reverse_time": bool(args.reverse_time),
+        "render_mode": str(args.render_mode),
+        "tri_edge_quantile": float(args.tri_edge_quantile),
+        "tri_edge_factor": float(args.tri_edge_factor),
         "rollout_seconds": t_roll,
         "gif_seconds": t_gif,
         "gif_paths": [os.path.abspath(p) for p in gif_paths],

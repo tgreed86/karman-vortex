@@ -2,7 +2,9 @@
 """
 train_basic_point.py
 
-Minimal temporal point-graph training script (no DEC/MLS physics, no AMR runtime mesh).
+Temporal point-graph training script (no AMR runtime mesh).
+Optional physics-derived node inputs are supported (DEC-like or MLS backend),
+mirroring the shock-ramp PARC-style conditioning pathway.
 
 Assumed data contract per timestep (PyG Data-like or dict-like):
   - x:          [N, Fx] node features at time t
@@ -21,7 +23,7 @@ Training modes:
   - multi-step windows (shock-ramp style): unrolled autoregressive training where
     predicted output at step k is fed as input at step k+1
 
-This script intentionally avoids all AMR/DEC/MLS pathways.
+This script intentionally avoids AMR runtime meshing; physics inputs are optional.
 
 Data source modes:
   - single file: cfg.data.pt_path points to one .pt/.pth/.zip file
@@ -47,8 +49,26 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
+from torch_geometric.data import Data
 
 from models import FeatureNet
+import utils.dec_ops as dec
+import utils.mls as mls
+
+
+_MLS_STATE = {
+    "sig": None,
+    "grad": None,
+    "lapw": None,
+    "adv": None,
+    "diff": None,
+}
+
+_GEOM_CACHE: Dict[Tuple[int, int, int, int, str], Dict[str, torch.Tensor]] = {}
+
+
+def _physics_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return cfg.get("physics", {}) or {}
 
 
 def set_seed(seed: int) -> None:
@@ -300,7 +320,7 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
     }
 
     print(
-        f"[INFO] detected case-level format: case={gp_base['case_name']} split={gp_base['split_name']} "
+        f"[INFO] detected case-level format: case={gp_base['case_name']} split_meta={gp_base['split_name']} "
         f"x_key={x_key} steps={T} nodes={n_nodes} feat_dim={int(x_tnf.size(2))}"
     )
 
@@ -449,6 +469,7 @@ class PointGraphTemporalDataset(Dataset):
     def __init__(self, cfg: Dict[str, Any], pt_paths: Optional[Sequence[str]] = None):
         super().__init__()
         data_cfg = cfg.get("data", {}) or {}
+        train_cfg = cfg.get("train", {}) or {}
         feat_cfg = cfg.get("features", {}) or {}
 
         if pt_paths is None:
@@ -461,6 +482,7 @@ class PointGraphTemporalDataset(Dataset):
             raise ValueError("PointGraphTemporalDataset requires at least one PT path.")
 
         use_y_target = bool(data_cfg.get("use_y_as_target", True))
+        reverse_time = bool(data_cfg.get("reverse_time", False))
         split_by_z = bool(data_cfg.get("split_by_z", False))
         z_index = int(data_cfg.get("z_index", 2))
         z_tol = float(data_cfg.get("z_tol", 0.0))
@@ -482,6 +504,8 @@ class PointGraphTemporalDataset(Dataset):
                     f"Need at least 2 timesteps in source file, found {len(raw_steps)}: {src_path}"
                 )
             steps = [_extract_step_fields(s) for s in raw_steps]
+            if reverse_time:
+                steps = list(reversed(steps))
 
             for t in range(len(steps) - 1):
                 s0 = steps[t]
@@ -603,6 +627,7 @@ class PointGraphWindowDataset(Dataset):
     def __init__(self, cfg: Dict[str, Any], pt_paths: Optional[Sequence[str]] = None):
         super().__init__()
         data_cfg = cfg.get("data", {}) or {}
+        train_cfg = cfg.get("train", {}) or {}
         feat_cfg = cfg.get("features", {}) or {}
 
         if pt_paths is None:
@@ -614,14 +639,15 @@ class PointGraphWindowDataset(Dataset):
         if len(pt_paths) == 0:
             raise ValueError("PointGraphWindowDataset requires at least one PT path.")
 
-        self.window_size = int(data_cfg.get("window_size", 2))
-        self.stride = int(data_cfg.get("stride", 1))
+        self.window_size = int(train_cfg.get("window_size", 2))
+        self.stride = int(train_cfg.get("stride", 1))
         if self.window_size < 2:
-            raise ValueError("data.window_size must be >= 2.")
+            raise ValueError("train.window_size must be >= 2.")
         if self.stride < 1:
-            raise ValueError("data.stride must be >= 1.")
+            raise ValueError("train.stride must be >= 1.")
 
         self.use_y_target = bool(data_cfg.get("use_y_as_target", True))
+        reverse_time = bool(data_cfg.get("reverse_time", False))
         split_by_z = bool(data_cfg.get("split_by_z", False))
         z_index = int(data_cfg.get("z_index", 2))
         z_tol = float(data_cfg.get("z_tol", 0.0))
@@ -644,6 +670,8 @@ class PointGraphWindowDataset(Dataset):
                     f"(source={src_path})."
                 )
             steps = [_extract_step_fields(s) for s in raw_steps]
+            if reverse_time:
+                steps = list(reversed(steps))
 
             src_sequences: Optional[List[List[Dict[str, Any]]]] = None
             for t, s in enumerate(steps):
@@ -913,6 +941,537 @@ def _maybe_denorm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[tor
     return x * std_ + mu_
 
 
+def _physics_inputs_enabled(cfg: Dict[str, Any]) -> bool:
+    phys = _physics_cfg(cfg)
+    include_adv = bool(phys.get("parc_include_adv", False))
+    include_diff = bool(phys.get("parc_include_diff", False))
+    return bool(include_adv or include_diff)
+
+
+def _physics_backend(cfg: Dict[str, Any]) -> str:
+    phys = _physics_cfg(cfg)
+    backend = str(phys.get("physics_backend", "dec")).lower().strip()
+    if backend in ("moving_least_squares", "moving-least-squares"):
+        backend = "mls"
+    if backend not in ("dec", "mls"):
+        backend = "dec"
+    return backend
+
+
+def _feature_names_for_dim(cfg: Dict[str, Any], fdim: int) -> List[str]:
+    feats = cfg.get("features", {}) or {}
+    raw = feats.get("names", None)
+    if not isinstance(raw, list) or len(raw) == 0:
+        return [f"feat_{i}" for i in range(fdim)]
+
+    names = [str(x) for x in raw]
+    use_cols = feats.get("use_columns", None)
+    if isinstance(use_cols, list) and len(use_cols) == fdim:
+        mapped: List[str] = []
+        ok = True
+        for c in use_cols:
+            ci = int(c)
+            if ci < 0 or ci >= len(names):
+                ok = False
+                break
+            mapped.append(names[ci])
+        if ok:
+            names = mapped
+
+    if len(names) < fdim:
+        names = names + [f"feat_{i}" for i in range(len(names), fdim)]
+    return names[:fdim]
+
+
+def _parse_channel_list(
+    spec: Any,
+    *,
+    fdim: int,
+    names: List[str],
+    default: List[int],
+) -> List[int]:
+    if spec is None:
+        return list(default)
+
+    if not isinstance(spec, list):
+        return list(default)
+
+    out: List[int] = []
+    name_map = {n.lower(): i for i, n in enumerate(names)}
+    for item in spec:
+        if isinstance(item, (int, np.integer)):
+            j = int(item)
+            if 0 <= j < fdim:
+                out.append(j)
+            continue
+        s = str(item).strip().lower()
+        if not s:
+            continue
+        if s in ("all", "*"):
+            return list(range(fdim))
+        if s in name_map:
+            out.append(int(name_map[s]))
+            continue
+        # permissive fallback: exact token contained in channel name
+        for i, nm in enumerate(names):
+            if s == nm.lower() or s in nm.lower():
+                out.append(i)
+                break
+
+    if len(out) == 0:
+        return list(default)
+
+    # de-dup preserve order
+    seen = set()
+    dedup: List[int] = []
+    for j in out:
+        if j not in seen:
+            seen.add(j)
+            dedup.append(j)
+    return dedup
+
+
+def _physics_channel_indices(cfg: Dict[str, Any], fdim: int, kind: str) -> List[int]:
+    phys = _physics_cfg(cfg)
+    names = _feature_names_for_dim(cfg, fdim)
+    default = list(range(fdim))
+    if kind == "adv":
+        spec = (
+            phys.get("parc_input_channels_adv", None)
+            or phys.get("adv_channels", None)
+            or phys.get("dec_adv_channels", None)
+            or phys.get("parc_input_channels", None)
+            or phys.get("channels", None)
+        )
+    else:
+        spec = (
+            phys.get("parc_input_channels_diff", None)
+            or phys.get("diff_channels", None)
+            or phys.get("dec_diff_channels", None)
+            or phys.get("parc_input_channels", None)
+            or phys.get("channels", None)
+        )
+    return _parse_channel_list(spec, fdim=fdim, names=names, default=default)
+
+
+def _physics_extra_in_channels(cfg: Dict[str, Any], fdim: int) -> int:
+    if not _physics_inputs_enabled(cfg):
+        return 0
+    phys = _physics_cfg(cfg)
+    include_adv = bool(phys.get("parc_include_adv", False))
+    include_diff = bool(phys.get("parc_include_diff", False))
+    n = 0
+    if include_adv:
+        n += len(_physics_channel_indices(cfg, fdim, "adv"))
+    if include_diff:
+        n += len(_physics_channel_indices(cfg, fdim, "diff"))
+    return int(n)
+
+
+def _infer_velocity_columns(cfg: Dict[str, Any], fdim: int) -> Tuple[int, int]:
+    phys = _physics_cfg(cfg)
+    names = [n.lower() for n in _feature_names_for_dim(cfg, fdim)]
+
+    vc = phys.get("velocity_channels", None)
+    if isinstance(vc, list) and len(vc) >= 2:
+        if all(isinstance(v, (int, np.integer)) for v in vc[:2]):
+            i0 = int(vc[0]); i1 = int(vc[1])
+            if 0 <= i0 < fdim and 0 <= i1 < fdim:
+                return i0, i1
+        # name-based velocity channels
+        idx = []
+        for v in vc[:2]:
+            s = str(v).strip().lower()
+            if s in names:
+                idx.append(names.index(s))
+            else:
+                idx.append(-1)
+        if idx[0] >= 0 and idx[1] >= 0:
+            return int(idx[0]), int(idx[1])
+
+    def _find(keys: Sequence[str], fallback: int) -> int:
+        for k in keys:
+            if k in names:
+                return names.index(k)
+        for i, nm in enumerate(names):
+            if any(k in nm for k in keys):
+                return i
+        return fallback
+
+    ix = _find(("velocity_x", "vel_x", "x_velocity", "ux"), 0)
+    iy = _find(("velocity_y", "vel_y", "y_velocity", "uy"), 1 if fdim > 1 else 0)
+    ix = max(0, min(ix, fdim - 1))
+    iy = max(0, min(iy, fdim - 1))
+    return int(ix), int(iy)
+
+
+def _mls_sig_from_cfg(cfg: Dict[str, Any]) -> Tuple[Any, ...]:
+    phys = _physics_cfg(cfg)
+    return (
+        bool(phys.get("mls_cache_by_geometry", False)),
+        bool(phys.get("mls_use_2hop_extension", True)),
+        bool(phys.get("mls_use_neighbor_damping", True)),
+        float(phys.get("mls_damping_alpha", 0.5)),
+        int(phys.get("mls_poly_order", 2)),
+        int(phys.get("mls_min_neighbors", 6)),
+    )
+
+
+def _get_mls_ops(cfg: Dict[str, Any]):
+    sig = _mls_sig_from_cfg(cfg)
+    if _MLS_STATE["sig"] == sig and _MLS_STATE["adv"] is not None and _MLS_STATE["diff"] is not None:
+        return _MLS_STATE["adv"], _MLS_STATE["diff"]
+
+    cache_by_geometry, use_2hop, use_damp, alpha, poly_order, min_nbrs = sig
+    grad = mls.SolveGradientsLST(
+        cache_by_geometry=cache_by_geometry,
+        use_2hop_extension=use_2hop,
+        use_neighbor_damping=use_damp,
+        damping_alpha=alpha,
+    )
+    lapw = mls.SolveWeightLST2d(
+        polynomial_order=poly_order,
+        min_neighbors=min_nbrs,
+        cache_by_geometry=cache_by_geometry,
+        use_2hop_extension=use_2hop,
+        use_neighbor_damping=use_damp,
+        damping_alpha=alpha,
+    )
+    adv = mls.AdvectionMLS(grad)
+    diff = mls.DiffusionMLS(lapw)
+    _MLS_STATE.update({"sig": sig, "grad": grad, "lapw": lapw, "adv": adv, "diff": diff})
+    return adv, diff
+
+
+def _geometry_from_pos_edge(
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    key = (
+        int(pos.data_ptr()),
+        int(edge_index.data_ptr()),
+        int(pos.size(0)),
+        int(edge_index.size(1)),
+        str(pos.device),
+    )
+    cached = _GEOM_CACHE.get(key, None)
+    if cached is not None:
+        return cached
+
+    if pos.size(1) < 2:
+        raise ValueError(f"Physics operators require at least 2D positions; got pos shape {tuple(pos.shape)}")
+
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    pxy = pos[:, :2].to(dtype=torch.float32)
+    dxy = pxy[dst] - pxy[src]
+    dist = torch.linalg.norm(dxy, dim=1).clamp_min(1e-12)
+
+    nx = dxy[:, 0] / dist
+    ny = dxy[:, 1] / dist
+    face_len = dist
+    dual_len = dist
+    tau = (face_len / dual_len).clamp_min(1e-12)
+
+    # Pseudo-cell area from local edge geometry:
+    # A_i ~= 0.5 * sum_j (face_len_ij * dual_len_ij) over outgoing edges.
+    contrib = 0.5 * (face_len * dual_len)
+    area = torch.zeros((pos.size(0),), device=pos.device, dtype=torch.float32)
+    area.index_add_(0, src, contrib)
+    pos_area = area > 0
+    if bool(pos_area.any()):
+        fallback = torch.median(area[pos_area]).clamp_min(1e-12)
+    else:
+        fallback = torch.tensor(1.0, device=pos.device, dtype=torch.float32)
+    area = torch.where(pos_area, area, fallback)
+    area = area.clamp_min(1e-12)
+
+    geom = {
+        "nx": nx,
+        "ny": ny,
+        "face_len": face_len,
+        "dual_len": dual_len,
+        "tau": tau,
+        "area": area,
+    }
+    _GEOM_CACHE[key] = geom
+    return geom
+
+
+def _velocity_from_features_or_state(x_abs: torch.Tensor, cfg: Dict[str, Any]) -> torch.Tensor:
+    phys = _physics_cfg(cfg)
+    adv_type = str(phys.get("advection_type", "scalar")).lower()
+    if adv_type == "euler":
+        fdim = int(x_abs.size(1))
+        idx = dec.infer_feature_indices(cfg, fdim)
+        rho = x_abs[:, idx["rho"]]
+        mx = x_abs[:, idx["mx"]]
+        my = x_abs[:, idx["my"]]
+        rho_floor = float(phys.get("rho_floor", 1e-6))
+        rho_eps = float(phys.get("rho_eps", 1e-8))
+        rho_safe = rho.clamp_min(max(rho_floor, rho_eps))
+        vel = torch.stack([mx / rho_safe, my / rho_safe], dim=1)
+        u_clip = float(phys.get("u_clip", 1e3))
+        if u_clip > 0:
+            vel = torch.clamp(vel, min=-u_clip, max=u_clip)
+        return vel
+
+    fdim = int(x_abs.size(1))
+    ix, iy = _infer_velocity_columns(cfg, fdim)
+    vel = torch.stack([x_abs[:, ix], x_abs[:, iy]], dim=1)
+    u_clip = float(phys.get("u_clip", 1e3))
+    if u_clip > 0:
+        vel = torch.clamp(vel, min=-u_clip, max=u_clip)
+    return vel
+
+
+def _physics_terms_dec_abs_point(
+    *,
+    x_abs: torch.Tensor,
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    cfg: Dict[str, Any],
+    compute_adv: bool,
+    compute_diff: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    geom = _geometry_from_pos_edge(pos, edge_index)
+    nx = geom["nx"].to(device=x_abs.device, dtype=x_abs.dtype)
+    ny = geom["ny"].to(device=x_abs.device, dtype=x_abs.dtype)
+    face_len = geom["face_len"].to(device=x_abs.device, dtype=x_abs.dtype)
+    tau = geom["tau"].to(device=x_abs.device, dtype=x_abs.dtype)
+    area = geom["area"].to(device=x_abs.device, dtype=x_abs.dtype)
+
+    N, fdim = x_abs.shape
+    phys = _physics_cfg(cfg)
+    sel_adv = _physics_channel_indices(cfg, fdim, "adv")
+    sel_diff = _physics_channel_indices(cfg, fdim, "diff")
+    adv_type = str(phys.get("advection_type", "scalar")).lower()
+
+    r_adv = x_abs.new_zeros((N, fdim))
+    r_diff = x_abs.new_zeros((N, fdim))
+
+    if compute_adv and len(sel_adv) > 0:
+        if adv_type == "euler":
+            scheme = str(phys.get("euler_flux_scheme", "rusanov")).lower()
+            rho_eps = float(phys.get("rho_eps", 1e-8))
+            cfg_dec = dict(cfg)
+            cfg_dec["loss"] = dict(phys)
+            div_full = dec.dec_divergence_euler_flux(
+                x_abs=x_abs,
+                edge_index=edge_index,
+                nx=nx,
+                ny=ny,
+                face_len=face_len,
+                area=area,
+                cfg=cfg_dec,
+                scheme=scheme,
+                eps=rho_eps,
+            )  # [N,4] in [rho,mx,my,E]
+            idx = dec.infer_feature_indices(cfg, fdim)
+            euler_idx = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
+            col_map = {j: k for k, j in enumerate(euler_idx)}
+            sel = [j for j in sel_adv if j in col_map]
+            if len(sel) > 0:
+                cols = [col_map[j] for j in sel]
+                r_adv[:, sel] = -div_full[:, cols]
+        else:
+            vel = _velocity_from_features_or_state(x_abs, cfg)
+            phi_adv = x_abs[:, sel_adv]
+            scheme = str(phys.get("advection_scheme", "upwind")).lower()
+            div_adv = dec.dec_divergence_advective_flux(
+                phi=phi_adv,
+                vel=vel,
+                edge_index=edge_index,
+                nx=nx,
+                ny=ny,
+                face_len=face_len,
+                area=area,
+                scheme=scheme,
+            )
+            r_adv[:, sel_adv] = -div_adv
+
+    if compute_diff and len(sel_diff) > 0:
+        nu_full = dec.as_nu_tensor(phys.get("nu", 0.0), fdim, device=x_abs.device, dtype=x_abs.dtype)
+        nu_sel = nu_full[torch.as_tensor(sel_diff, device=x_abs.device)].view(1, -1)
+        phi_diff = x_abs[:, sel_diff]
+        lap = dec.dec_laplacian(phi_diff, edge_index=edge_index, tau=tau, area=area)
+        r_diff[:, sel_diff] = lap * nu_sel
+
+    out_adv = r_adv if compute_adv else None
+    out_diff = r_diff if compute_diff else None
+    return out_adv, out_diff, area
+
+
+@torch.no_grad()
+def _physics_terms_mls_abs_point(
+    *,
+    x_abs: torch.Tensor,
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    cfg: Dict[str, Any],
+    compute_adv: bool,
+    compute_diff: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    phys = _physics_cfg(cfg)
+    ops_dev = torch.device(str(phys.get("mls_ops_device", "cpu")))
+    x_ops = x_abs.to(device=ops_dev, dtype=torch.float32)
+    pos_ops = pos[:, :2].to(device=ops_dev, dtype=torch.float32)
+    ei_ops = edge_index.to(device=ops_dev, dtype=torch.long)
+    data = Data(pos=pos_ops, edge_index=ei_ops)
+
+    vel = _velocity_from_features_or_state(x_ops, cfg).to(device=ops_dev, dtype=torch.float32)
+    adv_op, diff_op = _get_mls_ops(cfg)
+
+    r_adv = None
+    if compute_adv:
+        r_adv = adv_op(x_ops, vel, data)
+    r_diff = None
+    if compute_diff:
+        r_diff = diff_op(x_ops, data)
+        nu = phys.get("nu", 0.0)
+        nu_full = dec.as_nu_tensor(nu, x_ops.size(1), device=x_ops.device, dtype=x_ops.dtype)
+        r_diff = r_diff * nu_full.view(1, -1)
+
+    # restrict to selected channels for parity with DEC path
+    fdim = int(x_abs.size(1))
+    sel_adv = _physics_channel_indices(cfg, fdim, "adv")
+    sel_diff = _physics_channel_indices(cfg, fdim, "diff")
+    if r_adv is not None:
+        keep = torch.zeros_like(r_adv)
+        keep[:, sel_adv] = r_adv[:, sel_adv]
+        r_adv = keep
+    if r_diff is not None:
+        keep = torch.zeros_like(r_diff)
+        keep[:, sel_diff] = r_diff[:, sel_diff]
+        r_diff = keep
+
+    geom = _geometry_from_pos_edge(pos, edge_index)
+    area = geom["area"].to(device=x_abs.device, dtype=torch.float32)
+    if r_adv is not None:
+        r_adv = r_adv.to(device=x_abs.device, dtype=torch.float32)
+    if r_diff is not None:
+        r_diff = r_diff.to(device=x_abs.device, dtype=torch.float32)
+    return r_adv, r_diff, area
+
+
+def _safe_dt_scalar(t_src: Any, t_dst: Any, default_dt: float = 1.0) -> float:
+    try:
+        if t_src is None or t_dst is None:
+            return float(default_dt)
+        dt = float(t_dst) - float(t_src)
+        if not np.isfinite(dt):
+            return float(default_dt)
+        dt = abs(dt)
+        if dt <= 0.0:
+            return float(default_dt)
+        return float(dt)
+    except Exception:
+        return float(default_dt)
+
+
+@torch.no_grad()
+def _build_physics_extra_features(
+    *,
+    x_abs: torch.Tensor,
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    dt_phys_scalar: float,
+    cfg: Dict[str, Any],
+    norm: NormStats,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not _physics_inputs_enabled(cfg):
+        return None
+
+    phys = _physics_cfg(cfg)
+    include_adv = bool(phys.get("parc_include_adv", False))
+    include_diff = bool(phys.get("parc_include_diff", False))
+    adv_w = float(phys.get("adv_weight", 1.0))
+    diff_w = float(phys.get("diff_weight", 1.0))
+    need_adv = include_adv and (adv_w != 0.0)
+    need_diff = include_diff and (diff_w != 0.0)
+    if not need_adv and not need_diff:
+        return None
+
+    x_abs_f = x_abs.to(device=device, dtype=torch.float32)
+    pos_f = pos.to(device=device, dtype=torch.float32)
+    ei_f = edge_index.to(device=device, dtype=torch.long)
+
+    backend = _physics_backend(cfg)
+    if backend == "mls":
+        r_adv_abs, r_diff_abs, _area = _physics_terms_mls_abs_point(
+            x_abs=x_abs_f,
+            pos=pos_f,
+            edge_index=ei_f,
+            cfg=cfg,
+            compute_adv=need_adv,
+            compute_diff=need_diff,
+        )
+    else:
+        r_adv_abs, r_diff_abs, _area = _physics_terms_dec_abs_point(
+            x_abs=x_abs_f,
+            pos=pos_f,
+            edge_index=ei_f,
+            cfg=cfg,
+            compute_adv=need_adv,
+            compute_diff=need_diff,
+        )
+
+    # Optional weighting before conversion, matching shock-ramp option.
+    weighted = bool(phys.get("parc_input_weighted", False))
+    if weighted:
+        if r_adv_abs is not None:
+            r_adv_abs = adv_w * r_adv_abs
+        if r_diff_abs is not None:
+            r_diff_abs = diff_w * r_diff_abs
+
+    sigma = None if norm.y_std is None else norm.y_std.to(device=device, dtype=torch.float32)
+    dt_phys = torch.tensor(max(1e-12, abs(float(dt_phys_scalar))), device=device, dtype=torch.float32)
+    dt_ref_cfg = phys.get("dt_ref", None)
+    dt_ref = None
+    if dt_ref_cfg is not None:
+        try:
+            dt_ref = torch.tensor(float(dt_ref_cfg), device=device, dtype=torch.float32)
+        except Exception:
+            dt_ref = None
+    form = str(phys.get("parc_input_form", "rate")).lower()
+    predict_type = str(phys.get("parc_predict_type", "rate")).lower()
+
+    fdim = int(x_abs.size(1))
+    sel_adv = _physics_channel_indices(cfg, fdim, "adv")
+    sel_diff = _physics_channel_indices(cfg, fdim, "diff")
+    blocks: List[torch.Tensor] = []
+
+    def _to_units(r_abs: torch.Tensor) -> torch.Tensor:
+        if form == "delta":
+            if sigma is None:
+                return dt_phys * r_abs
+            return (dt_phys * r_abs) / sigma.view(1, -1).clamp_min(1e-12)
+        return dec.physics_to_model_units(
+            r_abs,
+            dt_phys=dt_phys,
+            dt_ref=dt_ref,
+            sigma=sigma,
+            predict_type=predict_type,
+        )
+
+    if include_adv and (r_adv_abs is not None) and len(sel_adv) > 0:
+        adv_u = _to_units(r_adv_abs.to(dtype=torch.float32))
+        blocks.append(adv_u[:, sel_adv])
+    if include_diff and (r_diff_abs is not None) and len(sel_diff) > 0:
+        diff_u = _to_units(r_diff_abs.to(dtype=torch.float32))
+        blocks.append(diff_u[:, sel_diff])
+
+    if len(blocks) == 0:
+        return None
+
+    out = torch.cat(blocks, dim=1).to(device=device, dtype=out_dtype)
+    if bool(phys.get("parc_detach_inputs", True)):
+        out = out.detach()
+    return out
+
+
 def _build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int, device: torch.device) -> FeatureNet:
     mcfg = cfg.get("model", {}) or {}
     model = FeatureNet(
@@ -931,6 +1490,7 @@ def _run_epoch(
     loader: DataLoader,
     optimizer: Optional[optim.Optimizer],
     *,
+    cfg: Dict[str, Any],
     device: torch.device,
     include_pos: bool,
     norm: NormStats,
@@ -953,14 +1513,28 @@ def _run_epoch(
         y = batch["y"].to(device=device, dtype=torch.float32)
         pos = batch["pos"].to(device=device, dtype=torch.float32)
         ei = batch["edge_index"].to(device=device, dtype=torch.long)
+        dt_phys = _safe_dt_scalar(batch.get("t_src", None), batch.get("t_dst", None), default_dt=1.0)
 
         x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
         y_tgt = _maybe_norm(y, norm.y_mu, norm.y_std)
 
+        x_parts = [x_in]
         if include_pos:
-            x_model = torch.cat([x_in, pos], dim=1)
-        else:
-            x_model = x_in
+            x_parts.append(pos)
+
+        phy_extra = _build_physics_extra_features(
+            x_abs=x,
+            pos=pos,
+            edge_index=ei,
+            dt_phys_scalar=dt_phys,
+            cfg=cfg,
+            norm=norm,
+            out_dtype=x_in.dtype,
+            device=device,
+        )
+        if phy_extra is not None and phy_extra.numel() > 0:
+            x_parts.append(phy_extra)
+        x_model = torch.cat(x_parts, dim=1)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -995,6 +1569,7 @@ def _run_epoch_multi_step(
     loader: DataLoader,
     optimizer: Optional[optim.Optimizer],
     *,
+    cfg: Dict[str, Any],
     device: torch.device,
     include_pos: bool,
     norm: NormStats,
@@ -1023,6 +1598,7 @@ def _run_epoch_multi_step(
         y_list = batch.get("y_list", None)
         pos_list = batch.get("pos_list", None)
         edge_index_list = batch.get("edge_index_list", None)
+        t_list = batch.get("t_list", None)
         if not isinstance(x_list, list) or not isinstance(y_list, list):
             raise RuntimeError("Multi-step mode requires batch keys: x_list, y_list, pos_list, edge_index_list.")
 
@@ -1074,7 +1650,27 @@ def _run_epoch_multi_step(
 
             x_in = _maybe_norm(x_in_abs, norm.x_mu, norm.x_std)
             y_tgt = _maybe_norm(y_tgt_abs, norm.y_mu, norm.y_std)
-            x_model = torch.cat([x_in, pos], dim=1) if include_pos else x_in
+            if isinstance(t_list, list) and (k + 1) < len(t_list):
+                dt_phys = _safe_dt_scalar(t_list[k], t_list[k + 1], default_dt=1.0)
+            else:
+                dt_phys = 1.0
+
+            x_parts = [x_in]
+            if include_pos:
+                x_parts.append(pos)
+            phy_extra = _build_physics_extra_features(
+                x_abs=x_in_abs,
+                pos=pos,
+                edge_index=ei,
+                dt_phys_scalar=dt_phys,
+                cfg=cfg,
+                norm=norm,
+                out_dtype=x_in.dtype,
+                device=device,
+            )
+            if phy_extra is not None and phy_extra.numel() > 0:
+                x_parts.append(phy_extra)
+            x_model = torch.cat(x_parts, dim=1)
 
             with torch.set_grad_enabled(train_mode):
                 y_pred_norm, _score, _h = model(x_model, ei)
@@ -1139,12 +1735,36 @@ def main(config_path: str) -> None:
     split_cfg = cfg.get("split", {}) or {}
     feat_cfg = cfg.get("features", {}) or {}
     loss_cfg = cfg.get("loss", {}) or {}
+    physics_cfg = _physics_cfg(cfg)
 
-    window_size = int(data_cfg.get("window_size", 2))
-    stride = int(data_cfg.get("stride", 1))
-    multi_step_k = int(train_cfg.get("multi_step_K", max(1, window_size - 1)))
+    window_size = int(train_cfg.get("window_size", 2))
+    stride = int(train_cfg.get("stride", 1))
+    reverse_time = bool(data_cfg.get("reverse_time", False))
+    if "multi_step_K" in train_cfg:
+        raise ValueError(
+            "train.multi_step_K is no longer supported. "
+            "Control multi-step rollout length via train.window_size (rollout_steps=window_size-1)."
+        )
+    if ("window_size" in data_cfg) or ("stride" in data_cfg):
+        print(
+            "[WARN] data.window_size/data.stride are deprecated and ignored. "
+            "Use train.window_size/train.stride."
+        )
+    legacy_phy_keys = {
+        "physics_backend", "parc_include_adv", "parc_include_diff",
+        "advection_type", "velocity_channels", "advection_scheme", "euler_flux_scheme",
+        "adv_weight", "diff_weight", "nu", "parc_input_form", "parc_predict_type",
+        "parc_detach_inputs", "parc_input_weighted", "mls_ops_device", "mls_use_2hop_extension",
+        "mls_use_neighbor_damping", "mls_damping_alpha", "mls_poly_order", "mls_min_neighbors",
+        "mls_cache_by_geometry", "rho_floor", "rho_eps", "u_clip",
+    }
+    if any(k in loss_cfg for k in legacy_phy_keys):
+        print(
+            "[WARN] physics keys found under cfg.loss; they are ignored. "
+            "Move them under cfg.physics."
+        )
     multi_step_autoreg = bool(train_cfg.get("autoregressive", True))
-    use_window_mode = (window_size > 2) or (multi_step_k > 1)
+    use_window_mode = (window_size > 2)
     f_train = float(split_cfg.get("train", 0.8))
     f_val = float(split_cfg.get("val", 0.1))
 
@@ -1153,9 +1773,11 @@ def main(config_path: str) -> None:
     use_pre_split_dirs = (source_mode == "pre_split_dir")
     if use_pre_split_dirs:
         print("[INFO] detected pre-split data directory; cfg.split train/val fractions will be ignored.")
+    if reverse_time:
+        print("[INFO] data.reverse_time=true; temporal order will be reversed before pair/window construction.")
 
     if use_window_mode:
-        rollout_steps = min(max(1, multi_step_k), window_size - 1)
+        rollout_steps = max(1, window_size - 1)
         if bool(data_cfg.get("use_y_as_target", True)):
             print(
                 "[WARN] data.use_y_as_target=true with autoregressive multi-step training. "
@@ -1255,7 +1877,12 @@ def main(config_path: str) -> None:
     else:
         stats = NormStats(None, None, None, None)
 
-    in_dim = dataset_for_dims.x_dim + (dataset_for_dims.pos_dim if include_pos else 0)
+    physics_extra_dim = _physics_extra_in_channels(cfg, dataset_for_dims.x_dim)
+    in_dim = (
+        dataset_for_dims.x_dim
+        + (dataset_for_dims.pos_dim if include_pos else 0)
+        + int(physics_extra_dim)
+    )
     out_dim = dataset_for_dims.y_dim
     model = _build_model(cfg, in_dim=in_dim, out_dim=out_dim, device=device)
 
@@ -1288,14 +1915,15 @@ def main(config_path: str) -> None:
                 f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
                 f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
-                f"autoregressive={multi_step_autoreg}"
+                f"autoregressive={multi_step_autoreg} reverse_time={reverse_time}"
             )
         else:
             print(
                 f"[INFO] dataset pairs={n_total} "
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
-                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim}"
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"reverse_time={reverse_time}"
             )
     else:
         if use_window_mode:
@@ -1304,18 +1932,24 @@ def main(config_path: str) -> None:
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
                 f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
-                f"autoregressive={multi_step_autoreg}"
+                f"autoregressive={multi_step_autoreg} reverse_time={reverse_time}"
             )
         else:
             print(
                 f"[INFO] dataset pairs={n_total} "
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
-                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim}"
+                f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"reverse_time={reverse_time}"
             )
     if normalize and stats.x_mu is not None:
         print("[INFO] normalization enabled (train split stats computed).")
     else:
         print("[INFO] normalization disabled.")
+    if _physics_inputs_enabled(cfg):
+        print(
+            f"[INFO] physics inputs enabled: backend={_physics_backend(cfg)} "
+            f"extra_in_channels={physics_extra_dim}"
+        )
 
     for ep in range(1, epochs + 1):
         ep_t0 = time.perf_counter()
@@ -1324,6 +1958,7 @@ def main(config_path: str) -> None:
                 model,
                 train_loader,
                 optimizer,
+                cfg=cfg,
                 device=device,
                 include_pos=include_pos,
                 norm=stats,
@@ -1338,6 +1973,7 @@ def main(config_path: str) -> None:
                 model,
                 train_loader,
                 optimizer,
+                cfg=cfg,
                 device=device,
                 include_pos=include_pos,
                 norm=stats,
@@ -1353,6 +1989,7 @@ def main(config_path: str) -> None:
                     model,
                     val_loader,
                     None,
+                    cfg=cfg,
                     device=device,
                     include_pos=include_pos,
                     norm=stats,
@@ -1367,6 +2004,7 @@ def main(config_path: str) -> None:
                     model,
                     val_loader,
                     None,
+                    cfg=cfg,
                     device=device,
                     include_pos=include_pos,
                     norm=stats,
@@ -1438,6 +2076,7 @@ def main(config_path: str) -> None:
             model,
             test_loader,
             None,
+            cfg=cfg,
             device=device,
             include_pos=include_pos,
             norm=stats,
@@ -1452,6 +2091,7 @@ def main(config_path: str) -> None:
             model,
             test_loader,
             None,
+            cfg=cfg,
             device=device,
             include_pos=include_pos,
             norm=stats,
@@ -1484,8 +2124,7 @@ def main(config_path: str) -> None:
                     None if split_files is None else {k: len(v) for k, v in split_files.items()}
                 ),
                 "num_workers": int(data_cfg.get("num_workers", 0)),
-                "window_size": int(window_size),
-                "stride": int(stride),
+                "reverse_time": bool(reverse_time),
                 "use_y_as_target": bool(data_cfg.get("use_y_as_target", True)),
                 "use_y_for_input": bool(data_cfg.get("use_y_for_input", False)),
                 "x_input_columns": data_cfg.get("x_input_columns", None),
@@ -1506,6 +2145,32 @@ def main(config_path: str) -> None:
                 "use_huber": bool(use_huber),
                 "huber_delta": float(huber_delta),
             },
+            "physics": {
+                "physics_backend": str(physics_cfg.get("physics_backend", "dec")),
+                "parc_include_adv": bool(physics_cfg.get("parc_include_adv", False)),
+                "parc_include_diff": bool(physics_cfg.get("parc_include_diff", False)),
+                "advection_type": str(physics_cfg.get("advection_type", "scalar")),
+                "velocity_channels": physics_cfg.get("velocity_channels", None),
+                "advection_scheme": str(physics_cfg.get("advection_scheme", "upwind")),
+                "euler_flux_scheme": str(physics_cfg.get("euler_flux_scheme", "rusanov")),
+                "adv_weight": float(physics_cfg.get("adv_weight", 1.0)),
+                "diff_weight": float(physics_cfg.get("diff_weight", 1.0)),
+                "nu": physics_cfg.get("nu", 0.0),
+                "parc_input_form": str(physics_cfg.get("parc_input_form", "rate")),
+                "parc_predict_type": str(physics_cfg.get("parc_predict_type", "rate")),
+                "parc_detach_inputs": bool(physics_cfg.get("parc_detach_inputs", True)),
+                "parc_input_weighted": bool(physics_cfg.get("parc_input_weighted", False)),
+                "mls_ops_device": str(physics_cfg.get("mls_ops_device", "cpu")),
+                "mls_use_2hop_extension": bool(physics_cfg.get("mls_use_2hop_extension", True)),
+                "mls_use_neighbor_damping": bool(physics_cfg.get("mls_use_neighbor_damping", True)),
+                "mls_damping_alpha": float(physics_cfg.get("mls_damping_alpha", 0.5)),
+                "mls_poly_order": int(physics_cfg.get("mls_poly_order", 2)),
+                "mls_min_neighbors": int(physics_cfg.get("mls_min_neighbors", 6)),
+                "mls_cache_by_geometry": bool(physics_cfg.get("mls_cache_by_geometry", False)),
+                "rho_floor": float(physics_cfg.get("rho_floor", 1e-6)),
+                "rho_eps": float(physics_cfg.get("rho_eps", 1e-8)),
+                "u_clip": float(physics_cfg.get("u_clip", 1e3)),
+            },
             "train": {
                 "save_dir": str(save_dir),
                 "batch_size": int(batch_size),
@@ -1514,7 +2179,8 @@ def main(config_path: str) -> None:
                 "lr": float(train_cfg.get("lr", 1e-3)),
                 "weight_decay": float(train_cfg.get("weight_decay", 0.0)),
                 "grad_clip": float(grad_clip),
-                "multi_step_K": int(multi_step_k),
+                "window_size": int(window_size),
+                "stride": int(stride),
                 "autoregressive": bool(multi_step_autoreg),
             },
             "model": {
@@ -1526,6 +2192,11 @@ def main(config_path: str) -> None:
                 "dataset_mode": "window" if use_window_mode else "pair",
                 "rollout_steps": int(rollout_steps),
                 "split_mode": ("pre_split_dir" if use_pre_split_dirs else "random_split"),
+                "reverse_time": bool(reverse_time),
+                "physics_inputs_enabled": bool(_physics_inputs_enabled(cfg)),
+                "physics_backend": _physics_backend(cfg),
+                "physics_extra_in_channels": int(physics_extra_dim),
+                "model_in_dim": int(in_dim),
             },
         },
         "data_source_mode": source_mode,
@@ -1543,9 +2214,17 @@ def main(config_path: str) -> None:
             "stride": int(stride),
             "rollout_steps": int(rollout_steps),
             "autoregressive": bool(multi_step_autoreg),
+            "reverse_time": bool(reverse_time),
         },
         "splits": {"train": len(train_ds), "val": len(val_ds), "test": len(test_ds)},
-        "dims": {"x_dim": dataset_for_dims.x_dim, "y_dim": dataset_for_dims.y_dim, "pos_dim": dataset_for_dims.pos_dim},
+        "dims": {
+            "x_dim": dataset_for_dims.x_dim,
+            "y_dim": dataset_for_dims.y_dim,
+            "pos_dim": dataset_for_dims.pos_dim,
+            "physics_extra_in_channels": int(physics_extra_dim),
+            "model_in_dim": int(in_dim),
+            "model_out_dim": int(out_dim),
+        },
         "best_val_loss": best_val,
         "test_loss": te_loss,
         "test_mae": te_mae,
