@@ -64,8 +64,6 @@ _MLS_STATE = {
     "diff": None,
 }
 
-_GEOM_CACHE: Dict[Tuple[int, int, int, int, str], Dict[str, torch.Tensor]] = {}
-
 
 def _physics_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg.get("physics", {}) or {}
@@ -1147,16 +1145,15 @@ def _geometry_from_pos_edge(
     pos: torch.Tensor,
     edge_index: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
-    key = (
-        int(pos.data_ptr()),
-        int(edge_index.data_ptr()),
-        int(pos.size(0)),
-        int(edge_index.size(1)),
-        str(pos.device),
-    )
-    cached = _GEOM_CACHE.get(key, None)
-    if cached is not None:
-        return cached
+    # Do not cache geometry tensors here.
+    #
+    # Prior versions cached by (data_ptr, sizes, device). In CUDA training, each
+    # batch/step does `.to(device)` and typically gets fresh device allocations,
+    # so pointer-based keys almost never hit and the cache grows without bound.
+    # That manifests as epoch-to-epoch GPU memory growth and eventual OOM.
+    #
+    # Geometry assembly is inexpensive relative to GNN forward/backward, so
+    # recomputing per-step is safer and avoids retaining large CUDA tensors.
 
     if pos.size(1) < 2:
         raise ValueError(f"Physics operators require at least 2D positions; got pos shape {tuple(pos.shape)}")
@@ -1186,7 +1183,7 @@ def _geometry_from_pos_edge(
     area = torch.where(pos_area, area, fallback)
     area = area.clamp_min(1e-12)
 
-    geom = {
+    return {
         "nx": nx,
         "ny": ny,
         "face_len": face_len,
@@ -1194,8 +1191,6 @@ def _geometry_from_pos_edge(
         "tau": tau,
         "area": area,
     }
-    _GEOM_CACHE[key] = geom
-    return geom
 
 
 def _velocity_from_features_or_state(x_abs: torch.Tensor, cfg: Dict[str, Any]) -> torch.Tensor:
