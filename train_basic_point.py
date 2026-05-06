@@ -858,6 +858,54 @@ class NormStats:
     x_std: Optional[torch.Tensor]
     y_mu: Optional[torch.Tensor]
     y_std: Optional[torch.Tensor]
+    mode: str = "zscore"
+
+
+def _normalization_mode_from_cfg(cfg: Dict[str, Any]) -> str:
+    feats = cfg.get("features", {}) or {}
+    norm_blk = feats.get("normalization", None)
+    raw = None
+    if isinstance(norm_blk, dict):
+        raw = norm_blk.get("normalization_mode", None)
+    if raw is None:
+        raw = feats.get("normalization_mode", feats.get("norm_mode", "zscore"))
+    mode = str(raw).strip().lower()
+    if mode in ("zscore", "z_score", "standard", "standardize", "std"):
+        return "zscore"
+    if mode in (
+        "minmax_11",
+        "minmax",
+        "min_max",
+        "minus1_1",
+        "neg1_1",
+        "-1_1",
+        "-1to1",
+        "-1_to_1",
+    ):
+        return "minmax_11"
+    raise ValueError(
+        "Unsupported normalization mode. "
+        "Use features.normalization.normalization_mode (or legacy "
+        "features.normalization_mode) with value 'zscore' or 'minmax_11'."
+    )
+
+
+def _component_scale_mode_from_cfg(cfg: Dict[str, Any]) -> str:
+    feats = cfg.get("features", {}) or {}
+    raw = feats.get("component_scale_mode", feats.get("sigma_mode", "independent"))
+    norm_blk = feats.get("normalization", None)
+    if isinstance(norm_blk, dict):
+        raw = norm_blk.get("velocity_sigma_mode", norm_blk.get("momentum_sigma_mode", raw))
+
+    mode = str(raw).strip().lower()
+    if mode in ("independent", "per_channel", "per-channel", "channelwise"):
+        return "independent"
+    if mode in ("shared", "shared_rms", "shared-rms", "tied"):
+        return "shared"
+    raise ValueError(
+        "Unsupported component scale mode. "
+        "Use 'independent' or 'shared' (e.g., features.normalization.velocity_sigma_mode)."
+    )
 
 
 @torch.no_grad()
@@ -866,33 +914,64 @@ def _compute_norm_stats(
     indices: Sequence[int],
     device: torch.device,
     *,
+    mode: str = "zscore",
+    component_mode: str = "independent",
+    shared_channels: Optional[Sequence[int]] = None,
     rollout_steps: Optional[int] = None,
 ) -> NormStats:
+    mode = str(mode).strip().lower()
+    if mode not in ("zscore", "minmax_11"):
+        raise ValueError(f"Unsupported normalization mode: {mode}")
+    component_mode = str(component_mode).strip().lower()
+    if component_mode not in ("independent", "shared"):
+        raise ValueError(f"Unsupported component scale mode: {component_mode}")
+
     x_sum = None
     x_sq_sum = None
     y_sum = None
     y_sq_sum = None
+    x_min = None
+    x_max = None
+    y_min = None
+    y_max = None
     n_x = 0
     n_y = 0
 
     def _accum_xy(x_raw: torch.Tensor, y_raw: torch.Tensor) -> None:
-        nonlocal x_sum, x_sq_sum, y_sum, y_sq_sum, n_x, n_y
+        nonlocal x_sum, x_sq_sum, y_sum, y_sq_sum, x_min, x_max, y_min, y_max, n_x, n_y
         x = x_raw.to(device=device, dtype=torch.float32)
         y = y_raw.to(device=device, dtype=torch.float32)
-        if x_sum is None:
-            x_sum = x.sum(dim=0)
-            x_sq_sum = (x * x).sum(dim=0)
-        else:
-            x_sum += x.sum(dim=0)
-            x_sq_sum += (x * x).sum(dim=0)
-        n_x += int(x.size(0))
 
-        if y_sum is None:
-            y_sum = y.sum(dim=0)
-            y_sq_sum = (y * y).sum(dim=0)
+        if mode == "zscore":
+            if x_sum is None:
+                x_sum = x.sum(dim=0)
+                x_sq_sum = (x * x).sum(dim=0)
+            else:
+                x_sum += x.sum(dim=0)
+                x_sq_sum += (x * x).sum(dim=0)
+
+            if y_sum is None:
+                y_sum = y.sum(dim=0)
+                y_sq_sum = (y * y).sum(dim=0)
+            else:
+                y_sum += y.sum(dim=0)
+                y_sq_sum += (y * y).sum(dim=0)
         else:
-            y_sum += y.sum(dim=0)
-            y_sq_sum += (y * y).sum(dim=0)
+            x_lo = x.min(dim=0).values
+            x_hi = x.max(dim=0).values
+            y_lo = y.min(dim=0).values
+            y_hi = y.max(dim=0).values
+            if x_min is None:
+                x_min = x_lo
+                x_max = x_hi
+                y_min = y_lo
+                y_max = y_hi
+            else:
+                x_min = torch.minimum(x_min, x_lo)
+                x_max = torch.maximum(x_max, x_hi)
+                y_min = torch.minimum(y_min, y_lo)
+                y_max = torch.maximum(y_max, y_hi)
+        n_x += int(x.size(0))
         n_y += int(y.size(0))
 
     for idx in indices:
@@ -913,16 +992,52 @@ def _compute_norm_stats(
 
         raise KeyError("Dataset example must provide x/y tensors or x_list/y_list tensors.")
 
-    if x_sum is None or y_sum is None or n_x == 0 or n_y == 0:
-        return NormStats(None, None, None, None)
+    if n_x == 0 or n_y == 0:
+        return NormStats(None, None, None, None, mode=mode)
 
-    x_mu = x_sum / float(n_x)
-    y_mu = y_sum / float(n_y)
-    x_var = (x_sq_sum / float(n_x)) - (x_mu * x_mu)
-    y_var = (y_sq_sum / float(n_y)) - (y_mu * y_mu)
-    x_std = torch.sqrt(torch.clamp(x_var, min=1e-12))
-    y_std = torch.sqrt(torch.clamp(y_var, min=1e-12))
-    return NormStats(x_mu, x_std, y_mu, y_std)
+    if mode == "zscore":
+        if x_sum is None or y_sum is None:
+            return NormStats(None, None, None, None, mode=mode)
+        x_mu = x_sum / float(n_x)
+        y_mu = y_sum / float(n_y)
+        x_var = (x_sq_sum / float(n_x)) - (x_mu * x_mu)
+        y_var = (y_sq_sum / float(n_y)) - (y_mu * y_mu)
+        x_std = torch.sqrt(torch.clamp(x_var, min=1e-12))
+        y_std = torch.sqrt(torch.clamp(y_var, min=1e-12))
+    else:
+        if x_min is None or x_max is None or y_min is None or y_max is None:
+            return NormStats(None, None, None, None, mode=mode)
+        x_mu = 0.5 * (x_min + x_max)
+        y_mu = 0.5 * (y_min + y_max)
+        x_std = (0.5 * (x_max - x_min)).clamp_min(1e-12)
+        y_std = (0.5 * (y_max - y_min)).clamp_min(1e-12)
+
+    if component_mode == "shared" and shared_channels is not None:
+        idx: List[int] = []
+        for c in shared_channels:
+            ci = int(c)
+            if 0 <= ci < int(x_std.numel()) and ci not in idx:
+                idx.append(ci)
+        if len(idx) >= 2:
+            idx_t = torch.as_tensor(idx, device=x_std.device, dtype=torch.long)
+            x_sel = x_std.index_select(0, idx_t)
+            y_sel = y_std.index_select(0, idx_t)
+
+            if mode == "zscore":
+                # Tie selected components by their RMS scale.
+                x_shared = torch.sqrt(torch.mean(x_sel * x_sel)).clamp_min(1e-12)
+                y_shared = torch.sqrt(torch.mean(y_sel * y_sel)).clamp_min(1e-12)
+            else:
+                # Keep minmax_11 bounded for all tied channels by using max half-range.
+                x_shared = torch.max(x_sel).clamp_min(1e-12)
+                y_shared = torch.max(y_sel).clamp_min(1e-12)
+
+            x_std = x_std.clone()
+            y_std = y_std.clone()
+            x_std[idx_t] = x_shared
+            y_std[idx_t] = y_shared
+
+    return NormStats(x_mu, x_std, y_mu, y_std, mode=mode)
 
 
 def _maybe_norm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1101,6 +1216,45 @@ def _infer_velocity_columns(cfg: Dict[str, Any], fdim: int) -> Tuple[int, int]:
     ix = max(0, min(ix, fdim - 1))
     iy = max(0, min(iy, fdim - 1))
     return int(ix), int(iy)
+
+
+def _shared_component_channels_from_cfg(cfg: Dict[str, Any], fdim: int) -> List[int]:
+    if fdim <= 0:
+        return []
+
+    feats = cfg.get("features", {}) or {}
+    names = _feature_names_for_dim(cfg, fdim)
+    norm_blk = feats.get("normalization", None)
+    spec = feats.get("shared_channels", None)
+    if spec is None and isinstance(norm_blk, dict):
+        spec = norm_blk.get("shared_channels", None)
+
+    if spec is not None:
+        chans = _parse_channel_list(spec, fdim=fdim, names=names, default=[])
+        out: List[int] = []
+        for c in chans:
+            ci = int(c)
+            if 0 <= ci < fdim and ci not in out:
+                out.append(ci)
+        if len(out) >= 2:
+            return out
+
+    # Default shared pair: inferred velocity components.
+    try:
+        i0, i1 = _infer_velocity_columns(cfg, fdim)
+        out = []
+        for c in (i0, i1):
+            ci = int(c)
+            if 0 <= ci < fdim and ci not in out:
+                out.append(ci)
+        if len(out) >= 2:
+            return out
+    except Exception:
+        pass
+
+    if fdim >= 2:
+        return [0, 1]
+    return [0]
 
 
 def _mls_sig_from_cfg(cfg: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -1784,6 +1938,8 @@ def main(config_path: str) -> None:
 
     include_pos = bool(feat_cfg.get("include_pos", True))
     normalize = bool(feat_cfg.get("normalize", True))
+    norm_mode = _normalization_mode_from_cfg(cfg)
+    component_mode = _component_scale_mode_from_cfg(cfg)
     use_huber = bool(loss_cfg.get("use_huber", False))
     huber_delta = float(loss_cfg.get("huber_delta", 0.05))
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
@@ -1861,16 +2017,21 @@ def main(config_path: str) -> None:
         collate_fn=_collate_one,
     )
 
+    shared_channels = _shared_component_channels_from_cfg(cfg, int(dataset_for_dims.x_dim))
+
     # Normalization stats from train split.
     if normalize:
         stats = _compute_norm_stats(
             norm_dataset,
             norm_indices,
             device=device,
+            mode=norm_mode,
+            component_mode=component_mode,
+            shared_channels=shared_channels,
             rollout_steps=(rollout_steps if use_window_mode else 1),
         )
     else:
-        stats = NormStats(None, None, None, None)
+        stats = NormStats(None, None, None, None, mode=norm_mode)
 
     physics_extra_dim = _physics_extra_in_channels(cfg, dataset_for_dims.x_dim)
     in_dim = (
@@ -1937,9 +2098,17 @@ def main(config_path: str) -> None:
                 f"reverse_time={reverse_time}"
             )
     if normalize and stats.x_mu is not None:
-        print("[INFO] normalization enabled (train split stats computed).")
+        print(
+            f"[INFO] normalization enabled "
+            f"(mode={stats.mode}, component_mode={component_mode}; train split stats computed)."
+        )
+        if component_mode == "shared":
+            print(f"[INFO] shared component scaling channels={shared_channels}")
     else:
-        print("[INFO] normalization disabled.")
+        print(
+            f"[INFO] normalization disabled "
+            f"(configured mode={norm_mode}, component_mode={component_mode})."
+        )
     if _physics_inputs_enabled(cfg):
         print(
             f"[INFO] physics inputs enabled: backend={_physics_backend(cfg)} "
@@ -2014,6 +2183,8 @@ def main(config_path: str) -> None:
                         "model_state_dict": model.state_dict(),
                         "cfg": cfg,
                         "norm": {
+                            "mode": str(stats.mode),
+                            "component_mode": str(component_mode),
                             "x_mu": None if stats.x_mu is None else stats.x_mu.detach().cpu(),
                             "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
                             "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
@@ -2051,6 +2222,8 @@ def main(config_path: str) -> None:
             "model_state_dict": model.state_dict(),
             "cfg": cfg,
             "norm": {
+                "mode": str(stats.mode),
+                "component_mode": str(component_mode),
                 "x_mu": None if stats.x_mu is None else stats.x_mu.detach().cpu(),
                 "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
                 "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
@@ -2135,6 +2308,9 @@ def main(config_path: str) -> None:
             "features": {
                 "include_pos": bool(include_pos),
                 "normalize": bool(normalize),
+                "normalization_mode": str(norm_mode),
+                "component_scale_mode": str(component_mode),
+                "shared_channels": [int(c) for c in shared_channels],
             },
             "loss": {
                 "use_huber": bool(use_huber),

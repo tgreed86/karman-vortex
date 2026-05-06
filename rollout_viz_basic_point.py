@@ -25,6 +25,7 @@ import json
 import os
 import random
 import time
+from types import SimpleNamespace
 import zipfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -38,6 +39,7 @@ import numpy as np
 import torch
 
 from models import FeatureNet
+from train_basic_point import _build_physics_extra_features, _physics_inputs_enabled, _safe_dt_scalar
 
 
 def set_seed(seed: int) -> None:
@@ -630,6 +632,7 @@ def run_rollout(
     seed: int,
     force_teacher: bool,
     z_slice: Optional[int],
+    expected_in_dim: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     data_cfg = cfg.get("data", {}) or {}
     feat_cfg = cfg.get("features", {}) or {}
@@ -660,6 +663,8 @@ def run_rollout(
     examples: List[Dict[str, Any]] = []
     prev_pred_x_abs: Optional[torch.Tensor] = None
     used_autoreg = False
+    norm_obj = SimpleNamespace(x_mu=norm_x_mu, x_std=norm_x_std, y_mu=norm_y_mu, y_std=norm_y_std)
+    physics_inputs_enabled = bool(_physics_inputs_enabled(cfg))
 
     for t in range(t0, t1):
         s_t = steps[t]
@@ -706,12 +711,36 @@ def run_rollout(
             x_in_abs = prev_pred_x_abs
             used_autoreg = True
 
-        x_in = _maybe_norm(x_in_abs.to(device), norm_x_mu, norm_x_std)
-        pos_dev = pos_t.to(device)
+        x_abs_dev = x_in_abs.to(device=device, dtype=torch.float32)
+        x_in = _maybe_norm(x_abs_dev, norm_x_mu, norm_x_std)
+        pos_dev = pos_t.to(device=device, dtype=torch.float32)
         ei_dev = ei_t.to(device=device, dtype=torch.long)
 
         include_pos = bool(feat_cfg.get("include_pos", True))
-        x_model = torch.cat([x_in, pos_dev], dim=1) if include_pos else x_in
+        x_parts = [x_in]
+        if include_pos:
+            x_parts.append(pos_dev)
+        if physics_inputs_enabled:
+            dt_phys = _safe_dt_scalar(s_t.get("time", None), s_tp1.get("time", None), default_dt=1.0)
+            phy_extra = _build_physics_extra_features(
+                x_abs=x_abs_dev,
+                pos=pos_dev,
+                edge_index=ei_dev,
+                dt_phys_scalar=dt_phys,
+                cfg=cfg,
+                norm=norm_obj,
+                out_dtype=x_in.dtype,
+                device=device,
+            )
+            if phy_extra is not None and phy_extra.numel() > 0:
+                x_parts.append(phy_extra)
+        x_model = torch.cat(x_parts, dim=1)
+        if expected_in_dim is not None and expected_in_dim > 0 and int(x_model.size(1)) != int(expected_in_dim):
+            raise RuntimeError(
+                "Rollout input dim mismatch: "
+                f"built {int(x_model.size(1))} channels, but checkpoint expects {int(expected_in_dim)}. "
+                f"(include_pos={include_pos}, physics_inputs_enabled={physics_inputs_enabled})"
+            )
 
         with torch.no_grad():
             y_pred_norm, _score, _h = model(x_model, ei_dev)
@@ -1064,6 +1093,8 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     model = _build_model_from_ckpt(ckpt, cfg, device=device)
+    dims = ckpt.get("dims", {}) or {}
+    expected_in_dim = int(dims.get("in_dim", -1))
     norm = ckpt.get("norm", {}) or {}
     x_mu = _to_opt_tensor(norm.get("x_mu", None))
     x_std = _to_opt_tensor(norm.get("x_std", None))
@@ -1104,6 +1135,7 @@ def main() -> None:
         seed=int(args.seed),
         force_teacher=force_teacher,
         z_slice=args.z_slice,
+        expected_in_dim=(expected_in_dim if expected_in_dim > 0 else None),
     )
     t_roll = time.perf_counter() - t_start
 

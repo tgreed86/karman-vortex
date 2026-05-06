@@ -20,6 +20,11 @@
       "velocity_y"
     ],
     "normalize": true,
+    "normalization": {
+      "normalization_mode": "minmax_11",
+      "_comment_normalization_mode": "Options: 'zscore' for (x - mean) / std, 'minmax_11' for [-1,1]",
+      "velocity_sigma_mode": "shared"
+    },
     "include_pos": true,
     "pos_columns": [0, 1]
   },
@@ -57,7 +62,7 @@
 
   "physics": {
     "physics_backend": "dec",
-    "parc_include_adv": false,
+    "parc_include_adv": true,
     "parc_include_diff": false,
     "advection_type": "scalar",
     "velocity_channels": [0, 1],
