@@ -39,6 +39,7 @@ import io
 import json
 import os
 import random
+import re
 import time
 import zipfile
 from dataclasses import dataclass
@@ -121,6 +122,185 @@ def _extract_time(step_obj: Any) -> Optional[float]:
                 except Exception:
                     pass
     return None
+
+
+def _as_optional_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        t = torch.as_tensor(v).view(-1)
+        if int(t.numel()) < 1:
+            return None
+        out = float(t[0].item())
+    except Exception:
+        try:
+            out = float(v)
+        except Exception:
+            return None
+    if not np.isfinite(out):
+        return None
+    return out
+
+
+def _parse_reynolds_from_text(text: Any) -> Optional[float]:
+    if text is None:
+        return None
+    s = str(text)
+    pats = (
+        r"reynolds[_\-\s]*([0-9]+(?:\.[0-9]+)?)",
+        r"\bre[_\-\s]*([0-9]+(?:\.[0-9]+)?)\b",
+    )
+    for pat in pats:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m is None:
+            continue
+        try:
+            val = float(m.group(1))
+        except Exception:
+            continue
+        if np.isfinite(val) and (val > 0.0):
+            return val
+    return None
+
+
+def _extract_reynolds_from_mapping(d: Dict[str, Any]) -> Optional[float]:
+    for key in ("reynolds_number", "reynolds", "Re", "re"):
+        if key in d:
+            v = _as_optional_float(d.get(key, None))
+            if v is not None and v > 0.0:
+                return v
+    for key in ("case_name", "name", "source_name", "source_path"):
+        if key in d:
+            v = _parse_reynolds_from_text(d.get(key, None))
+            if v is not None:
+                return v
+    gp = d.get("global_params", None)
+    if isinstance(gp, dict):
+        v = _extract_reynolds_from_mapping(gp)
+        if v is not None:
+            return v
+    return None
+
+
+def _infer_reynolds_number(raw_obj: Any, raw_steps: Optional[Sequence[Any]], src_path: str) -> Optional[float]:
+    if isinstance(raw_obj, dict):
+        v = _extract_reynolds_from_mapping(raw_obj)
+        if v is not None:
+            return v
+        case_info = raw_obj.get("case_info", None)
+        if isinstance(case_info, dict):
+            for cmeta in case_info.values():
+                if isinstance(cmeta, dict):
+                    v = _extract_reynolds_from_mapping(cmeta)
+                    if v is not None:
+                        return v
+
+    if isinstance(raw_steps, Sequence) and len(raw_steps) > 0:
+        s0 = raw_steps[0]
+        gp = _extract_attr(s0, "global_params", None)
+        if isinstance(gp, dict):
+            v = _extract_reynolds_from_mapping(gp)
+            if v is not None:
+                return v
+
+    v = _parse_reynolds_from_text(os.path.basename(str(src_path)))
+    if v is not None:
+        return v
+    return _parse_reynolds_from_text(str(src_path))
+
+
+def _reynolds_input_cfg(cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    feats = cfg.get("features", {}) or {}
+    blk = feats.get("reynolds_input", None)
+
+    enabled_raw = feats.get("include_reynolds", feats.get("use_reynolds_input", False))
+    mode_raw = feats.get("reynolds_mode", "log")
+    if isinstance(blk, dict):
+        enabled_raw = blk.get("enabled", enabled_raw)
+        mode_raw = blk.get("mode", mode_raw)
+    elif isinstance(blk, (bool, int)):
+        enabled_raw = bool(blk)
+
+    enabled = bool(enabled_raw)
+    mode = str(mode_raw).strip().lower()
+    if mode in ("log", "log10", "log_re", "re_log"):
+        mode = "log"
+    elif mode in ("nu", "inv_re", "inverse_re", "one_over_re", "1/re"):
+        mode = "nu"
+    else:
+        if enabled:
+            raise ValueError(
+                "Unsupported Reynolds input mode. Use features.reynolds_input.mode="
+                "'log' (log10(Re)) or 'nu' (1/Re)."
+            )
+        mode = "log"
+    return enabled, mode
+
+
+def _reynolds_to_conditioning_value(reynolds_number: float, mode: str) -> float:
+    re_val = float(reynolds_number)
+    if (not np.isfinite(re_val)) or (re_val <= 0.0):
+        raise ValueError(f"Invalid Reynolds number for conditioning: {re_val}")
+    if mode == "log":
+        return float(np.log10(re_val))
+    if mode == "nu":
+        return float(1.0 / re_val)
+    raise ValueError(f"Unsupported Reynolds conditioning mode: {mode}")
+
+
+def _reynolds_from_meta(meta: Any) -> Optional[float]:
+    if isinstance(meta, dict):
+        v = _as_optional_float(meta.get("reynolds_number", None))
+        if v is not None and v > 0.0:
+            return v
+
+        gp = meta.get("global_params", None)
+        if isinstance(gp, dict):
+            v = _extract_reynolds_from_mapping(gp)
+            if v is not None:
+                return v
+
+        step_meta = meta.get("step_meta", None)
+        if isinstance(step_meta, list):
+            for sm in step_meta:
+                v = _reynolds_from_meta(sm)
+                if v is not None:
+                    return v
+    return None
+
+
+def _build_reynolds_node_feature(
+    *,
+    n_nodes: int,
+    cfg: Dict[str, Any],
+    meta: Any,
+    source_reynolds: Optional[float],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    enabled, mode = _reynolds_input_cfg(cfg)
+    if not enabled:
+        return None
+
+    re_val = _reynolds_from_meta(meta)
+    if re_val is None:
+        re_val = source_reynolds
+    if re_val is None:
+        src_hint = None
+        if isinstance(meta, dict):
+            src_hint = meta.get("source_path", None)
+            if src_hint is None and isinstance(meta.get("step_meta", None), list) and len(meta["step_meta"]) > 0:
+                sm0 = meta["step_meta"][0]
+                if isinstance(sm0, dict):
+                    src_hint = sm0.get("source_path", None)
+        raise RuntimeError(
+            "features.reynolds_input.enabled=true, but Reynolds number was not found in sample metadata. "
+            "Provide per-case metadata key 'reynolds_number' (or include it in case_name/path). "
+            f"source={src_hint}"
+        )
+
+    cond_val = _reynolds_to_conditioning_value(float(re_val), mode=mode)
+    return torch.full((int(n_nodes), 1), float(cond_val), device=device, dtype=dtype)
 
 
 def _load_torch_object(path_or_buf: Any, map_location: str = "cpu") -> Any:
@@ -497,6 +677,7 @@ class PointGraphTemporalDataset(Dataset):
         for src_idx, src_path in enumerate(pt_paths):
             raw_obj = _load_pt_or_zip(src_path)
             raw_steps = _extract_series(raw_obj)
+            src_reynolds = _infer_reynolds_number(raw_obj, raw_steps, src_path)
             if len(raw_steps) < 2:
                 raise ValueError(
                     f"Need at least 2 timesteps in source file, found {len(raw_steps)}: {src_path}"
@@ -561,6 +742,7 @@ class PointGraphTemporalDataset(Dataset):
                                     "z_group": gidx,
                                     "source_index": src_idx,
                                     "source_path": os.path.abspath(src_path),
+                                    "reynolds_number": src_reynolds,
                                 },
                             )
                         )
@@ -577,6 +759,7 @@ class PointGraphTemporalDataset(Dataset):
                                 "pair_t": t,
                                 "source_index": src_idx,
                                 "source_path": os.path.abspath(src_path),
+                                "reynolds_number": src_reynolds,
                             },
                         )
                     )
@@ -662,6 +845,7 @@ class PointGraphWindowDataset(Dataset):
         for src_idx, src_path in enumerate(pt_paths):
             raw_obj = _load_pt_or_zip(src_path)
             raw_steps = _extract_series(raw_obj)
+            src_reynolds = _infer_reynolds_number(raw_obj, raw_steps, src_path)
             if len(raw_steps) < self.window_size:
                 raise ValueError(
                     f"Need at least window_size={self.window_size} timesteps, found {len(raw_steps)} "
@@ -717,6 +901,7 @@ class PointGraphWindowDataset(Dataset):
                                     "z_group": gidx,
                                     "source_index": src_idx,
                                     "source_path": os.path.abspath(src_path),
+                                    "reynolds_number": src_reynolds,
                                 },
                             }
                         )
@@ -739,6 +924,7 @@ class PointGraphWindowDataset(Dataset):
                                 "t": t,
                                 "source_index": src_idx,
                                 "source_path": os.path.abspath(src_path),
+                                "reynolds_number": src_reynolds,
                             },
                         }
                     )
@@ -807,6 +993,7 @@ class PointGraphWindowDataset(Dataset):
                 "start_t": start,
                 "window_size": self.window_size,
                 "step_meta": [s.get("meta", {}) for s in chunk],
+                "reynolds_number": chunk[0].get("meta", {}).get("reynolds_number", None),
             },
             # Back-compat convenience for one-step paths.
             "x": x_list[0],
@@ -859,16 +1046,12 @@ class NormStats:
     y_mu: Optional[torch.Tensor]
     y_std: Optional[torch.Tensor]
     mode: str = "zscore"
+    pos_mu: Optional[torch.Tensor] = None
+    pos_std: Optional[torch.Tensor] = None
+    pos_mode: str = "none"
 
 
-def _normalization_mode_from_cfg(cfg: Dict[str, Any]) -> str:
-    feats = cfg.get("features", {}) or {}
-    norm_blk = feats.get("normalization", None)
-    raw = None
-    if isinstance(norm_blk, dict):
-        raw = norm_blk.get("normalization_mode", None)
-    if raw is None:
-        raw = feats.get("normalization_mode", feats.get("norm_mode", "zscore"))
+def _canonical_norm_mode(raw: Any, *, field_name: str) -> str:
     mode = str(raw).strip().lower()
     if mode in ("zscore", "z_score", "standard", "standardize", "std"):
         return "zscore"
@@ -884,10 +1067,48 @@ def _normalization_mode_from_cfg(cfg: Dict[str, Any]) -> str:
     ):
         return "minmax_11"
     raise ValueError(
-        "Unsupported normalization mode. "
-        "Use features.normalization.normalization_mode (or legacy "
-        "features.normalization_mode) with value 'zscore' or 'minmax_11'."
+        f"Unsupported normalization mode for {field_name}. "
+        "Use 'zscore' or 'minmax_11'."
     )
+
+
+def _normalization_mode_from_cfg(cfg: Dict[str, Any]) -> str:
+    feats = cfg.get("features", {}) or {}
+    norm_blk = feats.get("normalization", None)
+    raw = None
+    if isinstance(norm_blk, dict):
+        raw = norm_blk.get("normalization_mode", None)
+    if raw is None:
+        raw = feats.get("normalization_mode", feats.get("norm_mode", "zscore"))
+    return _canonical_norm_mode(
+        raw,
+        field_name="features.normalization.normalization_mode",
+    )
+
+
+def _pos_normalization_cfg(cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    feats = cfg.get("features", {}) or {}
+    pos_blk = feats.get("pos_normalization", None)
+
+    enabled_raw = feats.get("pos_normalize", False)
+    mode_raw = feats.get("pos_normalization_mode", None)
+    if isinstance(pos_blk, dict):
+        enabled_raw = pos_blk.get("enabled", enabled_raw)
+        mode_raw = pos_blk.get("mode", mode_raw)
+    elif isinstance(pos_blk, (bool, int)):
+        enabled_raw = bool(pos_blk)
+
+    enabled = bool(enabled_raw)
+    if mode_raw is None:
+        mode_raw = _normalization_mode_from_cfg(cfg)
+
+    if (not enabled) and (mode_raw is None):
+        return False, "zscore"
+    mode = _canonical_norm_mode(
+        mode_raw,
+        field_name="features.pos_normalization.mode",
+    )
+    return enabled, mode
 
 
 def _component_scale_mode_from_cfg(cfg: Dict[str, Any]) -> str:
@@ -915,16 +1136,22 @@ def _compute_norm_stats(
     device: torch.device,
     *,
     mode: str = "zscore",
+    compute_xy: bool = True,
     component_mode: str = "independent",
     shared_channels: Optional[Sequence[int]] = None,
+    compute_pos: bool = False,
+    pos_mode: str = "zscore",
     rollout_steps: Optional[int] = None,
 ) -> NormStats:
     mode = str(mode).strip().lower()
-    if mode not in ("zscore", "minmax_11"):
+    if compute_xy and mode not in ("zscore", "minmax_11"):
         raise ValueError(f"Unsupported normalization mode: {mode}")
     component_mode = str(component_mode).strip().lower()
     if component_mode not in ("independent", "shared"):
         raise ValueError(f"Unsupported component scale mode: {component_mode}")
+    pos_mode = str(pos_mode).strip().lower()
+    if compute_pos and pos_mode not in ("zscore", "minmax_11"):
+        raise ValueError(f"Unsupported position normalization mode: {pos_mode}")
 
     x_sum = None
     x_sq_sum = None
@@ -936,6 +1163,11 @@ def _compute_norm_stats(
     y_max = None
     n_x = 0
     n_y = 0
+    p_sum = None
+    p_sq_sum = None
+    p_min = None
+    p_max = None
+    n_p = 0
 
     def _accum_xy(x_raw: torch.Tensor, y_raw: torch.Tensor) -> None:
         nonlocal x_sum, x_sq_sum, y_sum, y_sq_sum, x_min, x_max, y_min, y_max, n_x, n_y
@@ -974,45 +1206,85 @@ def _compute_norm_stats(
         n_x += int(x.size(0))
         n_y += int(y.size(0))
 
+    def _accum_pos(pos_raw: torch.Tensor) -> None:
+        nonlocal p_sum, p_sq_sum, p_min, p_max, n_p
+        p = pos_raw.to(device=device, dtype=torch.float32)
+        if pos_mode == "zscore":
+            if p_sum is None:
+                p_sum = p.sum(dim=0)
+                p_sq_sum = (p * p).sum(dim=0)
+            else:
+                p_sum += p.sum(dim=0)
+                p_sq_sum += (p * p).sum(dim=0)
+        else:
+            p_lo = p.min(dim=0).values
+            p_hi = p.max(dim=0).values
+            if p_min is None:
+                p_min = p_lo
+                p_max = p_hi
+            else:
+                p_min = torch.minimum(p_min, p_lo)
+                p_max = torch.maximum(p_max, p_hi)
+        n_p += int(p.size(0))
+
     for idx in indices:
         ex = dataset[int(idx)]
         if ("x" in ex) and ("y" in ex) and torch.is_tensor(ex["x"]) and torch.is_tensor(ex["y"]):
-            _accum_xy(ex["x"], ex["y"])
+            if compute_xy:
+                _accum_xy(ex["x"], ex["y"])
+            if compute_pos:
+                if ("pos" not in ex) or (not torch.is_tensor(ex["pos"])):
+                    raise KeyError("Position normalization requested, but dataset example has no tensor key 'pos'.")
+                _accum_pos(ex["pos"])
             continue
 
         x_list = ex.get("x_list", None)
         y_list = ex.get("y_list", None)
+        pos_list = ex.get("pos_list", None)
         if isinstance(x_list, list) and isinstance(y_list, list) and len(y_list) > 0:
             use_steps = len(y_list)
             if rollout_steps is not None:
                 use_steps = min(use_steps, max(1, int(rollout_steps)))
             for k in range(use_steps):
-                _accum_xy(x_list[k], y_list[k])
+                if compute_xy:
+                    _accum_xy(x_list[k], y_list[k])
+                if compute_pos:
+                    if (not isinstance(pos_list, list)) or k >= len(pos_list) or (not torch.is_tensor(pos_list[k])):
+                        raise KeyError(
+                            "Position normalization requested, but window example has no valid pos_list[k] tensor."
+                        )
+                    _accum_pos(pos_list[k])
             continue
 
         raise KeyError("Dataset example must provide x/y tensors or x_list/y_list tensors.")
 
-    if n_x == 0 or n_y == 0:
-        return NormStats(None, None, None, None, mode=mode)
+    x_mu = None
+    x_std = None
+    y_mu = None
+    y_std = None
+    if compute_xy and (n_x > 0) and (n_y > 0):
+        if mode == "zscore":
+            if x_sum is not None and y_sum is not None:
+                x_mu = x_sum / float(n_x)
+                y_mu = y_sum / float(n_y)
+                x_var = (x_sq_sum / float(n_x)) - (x_mu * x_mu)
+                y_var = (y_sq_sum / float(n_y)) - (y_mu * y_mu)
+                x_std = torch.sqrt(torch.clamp(x_var, min=1e-12))
+                y_std = torch.sqrt(torch.clamp(y_var, min=1e-12))
+        else:
+            if x_min is not None and x_max is not None and y_min is not None and y_max is not None:
+                x_mu = 0.5 * (x_min + x_max)
+                y_mu = 0.5 * (y_min + y_max)
+                x_std = (0.5 * (x_max - x_min)).clamp_min(1e-12)
+                y_std = (0.5 * (y_max - y_min)).clamp_min(1e-12)
 
-    if mode == "zscore":
-        if x_sum is None or y_sum is None:
-            return NormStats(None, None, None, None, mode=mode)
-        x_mu = x_sum / float(n_x)
-        y_mu = y_sum / float(n_y)
-        x_var = (x_sq_sum / float(n_x)) - (x_mu * x_mu)
-        y_var = (y_sq_sum / float(n_y)) - (y_mu * y_mu)
-        x_std = torch.sqrt(torch.clamp(x_var, min=1e-12))
-        y_std = torch.sqrt(torch.clamp(y_var, min=1e-12))
-    else:
-        if x_min is None or x_max is None or y_min is None or y_max is None:
-            return NormStats(None, None, None, None, mode=mode)
-        x_mu = 0.5 * (x_min + x_max)
-        y_mu = 0.5 * (y_min + y_max)
-        x_std = (0.5 * (x_max - x_min)).clamp_min(1e-12)
-        y_std = (0.5 * (y_max - y_min)).clamp_min(1e-12)
-
-    if component_mode == "shared" and shared_channels is not None:
+    if (
+        compute_xy
+        and x_std is not None
+        and y_std is not None
+        and component_mode == "shared"
+        and shared_channels is not None
+    ):
         idx: List[int] = []
         for c in shared_channels:
             ci = int(c)
@@ -1037,7 +1309,31 @@ def _compute_norm_stats(
             x_std[idx_t] = x_shared
             y_std[idx_t] = y_shared
 
-    return NormStats(x_mu, x_std, y_mu, y_std, mode=mode)
+    pos_mu = None
+    pos_std = None
+    out_pos_mode = "none"
+    if compute_pos and (n_p > 0):
+        out_pos_mode = pos_mode
+        if pos_mode == "zscore":
+            if p_sum is not None:
+                pos_mu = p_sum / float(n_p)
+                p_var = (p_sq_sum / float(n_p)) - (pos_mu * pos_mu)
+                pos_std = torch.sqrt(torch.clamp(p_var, min=1e-12))
+        else:
+            if p_min is not None and p_max is not None:
+                pos_mu = 0.5 * (p_min + p_max)
+                pos_std = (0.5 * (p_max - p_min)).clamp_min(1e-12)
+
+    return NormStats(
+        x_mu,
+        x_std,
+        y_mu,
+        y_std,
+        mode=mode,
+        pos_mu=pos_mu,
+        pos_std=pos_std,
+        pos_mode=out_pos_mode,
+    )
 
 
 def _maybe_norm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1666,10 +1962,21 @@ def _run_epoch(
 
         x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
         y_tgt = _maybe_norm(y, norm.y_mu, norm.y_std)
+        pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std)
 
         x_parts = [x_in]
+        re_extra = _build_reynolds_node_feature(
+            n_nodes=int(x_in.size(0)),
+            cfg=cfg,
+            meta=batch.get("meta", None),
+            source_reynolds=None,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if re_extra is not None and re_extra.numel() > 0:
+            x_parts.append(re_extra)
         if include_pos:
-            x_parts.append(pos)
+            x_parts.append(pos_in)
 
         phy_extra = _build_physics_extra_features(
             x_abs=x,
@@ -1799,14 +2106,25 @@ def _run_epoch_multi_step(
 
             x_in = _maybe_norm(x_in_abs, norm.x_mu, norm.x_std)
             y_tgt = _maybe_norm(y_tgt_abs, norm.y_mu, norm.y_std)
+            pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std)
             if isinstance(t_list, list) and (k + 1) < len(t_list):
                 dt_phys = _safe_dt_scalar(t_list[k], t_list[k + 1], default_dt=1.0)
             else:
                 dt_phys = 1.0
 
             x_parts = [x_in]
+            re_extra = _build_reynolds_node_feature(
+                n_nodes=int(x_in.size(0)),
+                cfg=cfg,
+                meta=batch.get("meta", None),
+                source_reynolds=None,
+                device=device,
+                dtype=x_in.dtype,
+            )
+            if re_extra is not None and re_extra.numel() > 0:
+                x_parts.append(re_extra)
             if include_pos:
-                x_parts.append(pos)
+                x_parts.append(pos_in)
             phy_extra = _build_physics_extra_features(
                 x_abs=x_in_abs,
                 pos=pos,
@@ -1937,8 +2255,13 @@ def main(config_path: str) -> None:
         multi_step_autoreg = False
 
     include_pos = bool(feat_cfg.get("include_pos", True))
+    include_reynolds, reynolds_mode = _reynolds_input_cfg(cfg)
     normalize = bool(feat_cfg.get("normalize", True))
     norm_mode = _normalization_mode_from_cfg(cfg)
+    pos_normalize, pos_norm_mode = _pos_normalization_cfg(cfg)
+    if (not include_pos) and pos_normalize:
+        print("[WARN] features.pos_normalization.enabled=true but features.include_pos=false; disabling pos normalization.")
+        pos_normalize = False
     component_mode = _component_scale_mode_from_cfg(cfg)
     use_huber = bool(loss_cfg.get("use_huber", False))
     huber_delta = float(loss_cfg.get("huber_delta", 0.05))
@@ -2020,22 +2343,26 @@ def main(config_path: str) -> None:
     shared_channels = _shared_component_channels_from_cfg(cfg, int(dataset_for_dims.x_dim))
 
     # Normalization stats from train split.
-    if normalize:
+    if normalize or pos_normalize:
         stats = _compute_norm_stats(
             norm_dataset,
             norm_indices,
             device=device,
             mode=norm_mode,
+            compute_xy=bool(normalize),
             component_mode=component_mode,
             shared_channels=shared_channels,
+            compute_pos=bool(pos_normalize and include_pos),
+            pos_mode=pos_norm_mode,
             rollout_steps=(rollout_steps if use_window_mode else 1),
         )
     else:
-        stats = NormStats(None, None, None, None, mode=norm_mode)
+        stats = NormStats(None, None, None, None, mode=norm_mode, pos_mode="none")
 
     physics_extra_dim = _physics_extra_in_channels(cfg, dataset_for_dims.x_dim)
     in_dim = (
         dataset_for_dims.x_dim
+        + (1 if include_reynolds else 0)
         + (dataset_for_dims.pos_dim if include_pos else 0)
         + int(physics_extra_dim)
     )
@@ -2104,11 +2431,27 @@ def main(config_path: str) -> None:
         )
         if component_mode == "shared":
             print(f"[INFO] shared component scaling channels={shared_channels}")
+    elif normalize:
+        print(
+            f"[WARN] feature normalization requested but stats were unavailable "
+            f"(mode={norm_mode}, component_mode={component_mode})."
+        )
     else:
         print(
             f"[INFO] normalization disabled "
             f"(configured mode={norm_mode}, component_mode={component_mode})."
         )
+    if pos_normalize and stats.pos_mu is not None:
+        print(
+            f"[INFO] position normalization enabled "
+            f"(mode={stats.pos_mode}; train split stats computed)."
+        )
+    elif pos_normalize:
+        print(f"[WARN] position normalization requested but stats were unavailable (mode={pos_norm_mode}).")
+    else:
+        print(f"[INFO] position normalization disabled (configured mode={pos_norm_mode}).")
+    if include_reynolds:
+        print(f"[INFO] Reynolds conditioning enabled: mode={reynolds_mode} (channel_dim=1).")
     if _physics_inputs_enabled(cfg):
         print(
             f"[INFO] physics inputs enabled: backend={_physics_backend(cfg)} "
@@ -2189,6 +2532,9 @@ def main(config_path: str) -> None:
                             "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
                             "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
                             "y_std": None if stats.y_std is None else stats.y_std.detach().cpu(),
+                            "pos_mode": str(stats.pos_mode),
+                            "pos_mu": None if stats.pos_mu is None else stats.pos_mu.detach().cpu(),
+                            "pos_std": None if stats.pos_std is None else stats.pos_std.detach().cpu(),
                         },
                         "dims": {"in_dim": in_dim, "out_dim": out_dim},
                     },
@@ -2228,6 +2574,9 @@ def main(config_path: str) -> None:
                 "x_std": None if stats.x_std is None else stats.x_std.detach().cpu(),
                 "y_mu": None if stats.y_mu is None else stats.y_mu.detach().cpu(),
                 "y_std": None if stats.y_std is None else stats.y_std.detach().cpu(),
+                "pos_mode": str(stats.pos_mode),
+                "pos_mu": None if stats.pos_mu is None else stats.pos_mu.detach().cpu(),
+                "pos_std": None if stats.pos_std is None else stats.pos_std.detach().cpu(),
             },
             "dims": {"in_dim": in_dim, "out_dim": out_dim},
         },
@@ -2307,6 +2656,10 @@ def main(config_path: str) -> None:
             },
             "features": {
                 "include_pos": bool(include_pos),
+                "pos_normalize": bool(pos_normalize),
+                "pos_normalization_mode": str(pos_norm_mode),
+                "include_reynolds": bool(include_reynolds),
+                "reynolds_mode": str(reynolds_mode),
                 "normalize": bool(normalize),
                 "normalization_mode": str(norm_mode),
                 "component_scale_mode": str(component_mode),

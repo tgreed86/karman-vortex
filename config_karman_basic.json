@@ -25,8 +25,19 @@
       "_comment_normalization_mode": "Options: 'zscore' for (x - mean) / std, 'minmax_11' for [-1,1]",
       "velocity_sigma_mode": "shared"
     },
+    "reynolds_input": {
+      "enabled": true,
+      "mode": "log",
+      "_comment_mode": "Options: 'log' -> log10(Re), 'nu' -> 1/Re"
+    },
     "include_pos": true,
-    "pos_columns": [0, 1]
+    "pos_columns": [0, 1],
+
+    "pos_normalization": {
+      "enabled": true,
+      "mode": "minmax_11",
+      "_comment_mode": "Options: 'zscore' or 'minmax_11'; applied only to GNN input pos channels."
+    }
   },
 
   "split": {
@@ -36,7 +47,7 @@
   },
 
   "train": {
-    "epochs": 1,
+    "epochs": 5,
     "validation_every_epochs": 1,
     "batch_size": 1,
     "lr": 0.0005,

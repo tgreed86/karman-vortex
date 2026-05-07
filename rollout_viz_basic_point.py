@@ -39,7 +39,13 @@ import numpy as np
 import torch
 
 from models import FeatureNet
-from train_basic_point import _build_physics_extra_features, _physics_inputs_enabled, _safe_dt_scalar
+from train_basic_point import (
+    _build_physics_extra_features,
+    _build_reynolds_node_feature,
+    _infer_reynolds_number,
+    _physics_inputs_enabled,
+    _safe_dt_scalar,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -306,6 +312,7 @@ def _extract_step_fields(step: Any) -> Dict[str, Any]:
         "pos": _as_2d_float(pos, "pos"),
         "edge_index": _as_edge_index(ei),
         "time": _extract_time(step),
+        "global_params": _extract_attr(step, "global_params", None),
     }
 
 
@@ -626,12 +633,15 @@ def run_rollout(
     norm_x_std: Optional[torch.Tensor],
     norm_y_mu: Optional[torch.Tensor],
     norm_y_std: Optional[torch.Tensor],
+    norm_pos_mu: Optional[torch.Tensor],
+    norm_pos_std: Optional[torch.Tensor],
     device: torch.device,
     start_t: int,
     horizon: int,
     seed: int,
     force_teacher: bool,
     z_slice: Optional[int],
+    source_reynolds: Optional[float],
     expected_in_dim: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     data_cfg = cfg.get("data", {}) or {}
@@ -663,7 +673,14 @@ def run_rollout(
     examples: List[Dict[str, Any]] = []
     prev_pred_x_abs: Optional[torch.Tensor] = None
     used_autoreg = False
-    norm_obj = SimpleNamespace(x_mu=norm_x_mu, x_std=norm_x_std, y_mu=norm_y_mu, y_std=norm_y_std)
+    norm_obj = SimpleNamespace(
+        x_mu=norm_x_mu,
+        x_std=norm_x_std,
+        y_mu=norm_y_mu,
+        y_std=norm_y_std,
+        pos_mu=norm_pos_mu,
+        pos_std=norm_pos_std,
+    )
     physics_inputs_enabled = bool(_physics_inputs_enabled(cfg))
 
     for t in range(t0, t1):
@@ -714,12 +731,23 @@ def run_rollout(
         x_abs_dev = x_in_abs.to(device=device, dtype=torch.float32)
         x_in = _maybe_norm(x_abs_dev, norm_x_mu, norm_x_std)
         pos_dev = pos_t.to(device=device, dtype=torch.float32)
+        pos_in = _maybe_norm(pos_dev, norm_pos_mu, norm_pos_std)
         ei_dev = ei_t.to(device=device, dtype=torch.long)
 
         include_pos = bool(feat_cfg.get("include_pos", True))
         x_parts = [x_in]
+        re_extra = _build_reynolds_node_feature(
+            n_nodes=int(x_in.size(0)),
+            cfg=cfg,
+            meta=s_t.get("global_params", None),
+            source_reynolds=source_reynolds,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if re_extra is not None and re_extra.numel() > 0:
+            x_parts.append(re_extra)
         if include_pos:
-            x_parts.append(pos_dev)
+            x_parts.append(pos_in)
         if physics_inputs_enabled:
             dt_phys = _safe_dt_scalar(s_t.get("time", None), s_tp1.get("time", None), default_dt=1.0)
             phy_extra = _build_physics_extra_features(
@@ -739,7 +767,8 @@ def run_rollout(
             raise RuntimeError(
                 "Rollout input dim mismatch: "
                 f"built {int(x_model.size(1))} channels, but checkpoint expects {int(expected_in_dim)}. "
-                f"(include_pos={include_pos}, physics_inputs_enabled={physics_inputs_enabled})"
+                f"(include_pos={include_pos}, physics_inputs_enabled={physics_inputs_enabled}, "
+                f"reynolds_input={re_extra is not None})"
             )
 
         with torch.no_grad():
@@ -1100,9 +1129,12 @@ def main() -> None:
     x_std = _to_opt_tensor(norm.get("x_std", None))
     y_mu = _to_opt_tensor(norm.get("y_mu", None))
     y_std = _to_opt_tensor(norm.get("y_std", None))
+    pos_mu = _to_opt_tensor(norm.get("pos_mu", None))
+    pos_std = _to_opt_tensor(norm.get("pos_std", None))
 
     data_obj = _load_pt_or_zip(pt_path)
     raw_steps = _extract_series(data_obj)
+    source_reynolds = _infer_reynolds_number(data_obj, raw_steps, pt_path)
     steps = [_extract_step_fields(s) for s in raw_steps]
     use_y_target = bool(cfg.get("data", {}).get("use_y_as_target", True))
     has_y_targets = any((s.get("y", None) is not None) for s in steps[: min(5, len(steps))])
@@ -1129,12 +1161,15 @@ def main() -> None:
         norm_x_std=x_std,
         norm_y_mu=y_mu,
         norm_y_std=y_std,
+        norm_pos_mu=pos_mu,
+        norm_pos_std=pos_std,
         device=device,
         start_t=int(args.start_t),
         horizon=int(args.horizon),
         seed=int(args.seed),
         force_teacher=force_teacher,
         z_slice=args.z_slice,
+        source_reynolds=source_reynolds,
         expected_in_dim=(expected_in_dim if expected_in_dim > 0 else None),
     )
     t_roll = time.perf_counter() - t_start
@@ -1177,6 +1212,7 @@ def main() -> None:
         "autoregressive_requested": bool(args.autoregressive),
         "used_autoregressive": bool(used_autoreg),
         "z_slice": args.z_slice,
+        "source_reynolds": (None if source_reynolds is None else float(source_reynolds)),
         "mean_mae": mean_mae,
         "target_label": target_label,
         "input_label": input_label,
