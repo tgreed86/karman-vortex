@@ -40,6 +40,7 @@ import torch
 
 from models import FeatureNet
 from train_basic_point import (
+    _build_boundary_mask_node_feature,
     _build_physics_extra_features,
     _build_reynolds_node_feature,
     _infer_reynolds_number,
@@ -746,6 +747,15 @@ def run_rollout(
         )
         if re_extra is not None and re_extra.numel() > 0:
             x_parts.append(re_extra)
+        bnd_extra = _build_boundary_mask_node_feature(
+            pos=pos_dev,
+            edge_index=ei_dev,
+            cfg=cfg,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if bnd_extra is not None and bnd_extra.numel() > 0:
+            x_parts.append(bnd_extra)
         if include_pos:
             x_parts.append(pos_in)
         if physics_inputs_enabled:
@@ -768,7 +778,7 @@ def run_rollout(
                 "Rollout input dim mismatch: "
                 f"built {int(x_model.size(1))} channels, but checkpoint expects {int(expected_in_dim)}. "
                 f"(include_pos={include_pos}, physics_inputs_enabled={physics_inputs_enabled}, "
-                f"reynolds_input={re_extra is not None})"
+                f"reynolds_input={re_extra is not None}, boundary_mask_input={bnd_extra is not None})"
             )
 
         with torch.no_grad():

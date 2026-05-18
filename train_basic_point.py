@@ -64,6 +64,7 @@ _MLS_STATE = {
     "adv": None,
     "diff": None,
 }
+_BOUNDARY_INFER_CACHE: Dict[Tuple[Any, ...], Dict[str, float]] = {}
 
 
 def _physics_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,6 +302,307 @@ def _build_reynolds_node_feature(
 
     cond_val = _reynolds_to_conditioning_value(float(re_val), mode=mode)
     return torch.full((int(n_nodes), 1), float(cond_val), device=device, dtype=dtype)
+
+
+def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    feats = cfg.get("features", {}) or {}
+    blk = feats.get("boundary_mask_input", None)
+
+    enabled_raw = feats.get("include_boundary_mask", False)
+    btype_raw: Any = "cylinder"
+    center_raw: Any = [0.0, 0.0]
+    radius_raw: Any = 0.5
+    band_raw: Any = 0.08
+    infer_raw: Any = False
+    infer_band_scale_raw: Any = 1.5
+    infer_min_nodes_raw: Any = 16
+
+    if isinstance(blk, dict):
+        enabled_raw = blk.get("enabled", enabled_raw)
+        btype_raw = blk.get("type", blk.get("boundary_type", btype_raw))
+        center_raw = blk.get("center_xy", blk.get("center", center_raw))
+        radius_raw = blk.get("radius", radius_raw)
+        band_raw = blk.get("band", blk.get("tolerance", band_raw))
+        infer_raw = blk.get("infer_from_data", blk.get("infer", infer_raw))
+        infer_band_scale_raw = blk.get("infer_band_scale", infer_band_scale_raw)
+        infer_min_nodes_raw = blk.get("infer_min_nodes", infer_min_nodes_raw)
+    elif isinstance(blk, (bool, int)):
+        enabled_raw = bool(blk)
+
+    if "boundary_mask_type" in feats:
+        btype_raw = feats.get("boundary_mask_type", btype_raw)
+    if "boundary_mask_center" in feats:
+        center_raw = feats.get("boundary_mask_center", center_raw)
+    if "boundary_mask_radius" in feats:
+        radius_raw = feats.get("boundary_mask_radius", radius_raw)
+    if "boundary_mask_band" in feats:
+        band_raw = feats.get("boundary_mask_band", band_raw)
+    if "boundary_mask_infer_from_data" in feats:
+        infer_raw = feats.get("boundary_mask_infer_from_data", infer_raw)
+
+    enabled = bool(enabled_raw)
+    btype = str(btype_raw).strip().lower()
+    infer_from_data = bool(infer_raw)
+
+    if isinstance(center_raw, (list, tuple)) and len(center_raw) >= 2:
+        cx = float(center_raw[0])
+        cy = float(center_raw[1])
+    else:
+        raise ValueError(
+            "features.boundary_mask_input.center_xy must be a list/tuple with two values [cx, cy]."
+        )
+
+    radius = float(radius_raw)
+    band = float(band_raw)
+    infer_band_scale = float(infer_band_scale_raw)
+    infer_min_nodes = int(infer_min_nodes_raw)
+    if enabled:
+        if btype != "cylinder":
+            raise ValueError("features.boundary_mask_input.type currently supports only 'cylinder'.")
+        if infer_from_data:
+            if infer_band_scale <= 0.0:
+                raise ValueError("features.boundary_mask_input.infer_band_scale must be > 0.")
+            if infer_min_nodes < 8:
+                raise ValueError("features.boundary_mask_input.infer_min_nodes must be >= 8.")
+        else:
+            if radius <= 0.0:
+                raise ValueError("features.boundary_mask_input.radius must be > 0.")
+            if band <= 0.0:
+                raise ValueError("features.boundary_mask_input.band must be > 0.")
+
+    return {
+        "enabled": enabled,
+        "type": btype,
+        "center_xy": [cx, cy],
+        "radius": radius,
+        "band": band,
+        "infer_from_data": infer_from_data,
+        "infer_band_scale": infer_band_scale,
+        "infer_min_nodes": infer_min_nodes,
+    }
+
+
+def _infer_cylinder_params_from_geometry(
+    *,
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    infer_band_scale: float,
+    infer_min_nodes: int,
+) -> Dict[str, float]:
+    if pos.ndim != 2 or int(pos.size(1)) < 2:
+        raise ValueError(f"Expected pos shape [N,>=2], got {tuple(pos.shape)}")
+    if edge_index.ndim != 2:
+        raise ValueError(f"Expected edge_index rank 2, got {tuple(edge_index.shape)}")
+
+    pxy = pos[:, :2].detach().to(device="cpu", dtype=torch.float32).numpy()
+    ei = edge_index.detach().to(device="cpu", dtype=torch.long)
+    if ei.size(0) != 2 and ei.size(1) == 2:
+        ei = ei.t().contiguous()
+    if ei.size(0) != 2:
+        raise ValueError(f"Expected edge_index [2,E] or [E,2], got {tuple(edge_index.shape)}")
+
+    src = ei[0].numpy()
+    dst = ei[1].numpy()
+    n = int(pxy.shape[0])
+
+    deg = np.bincount(src, minlength=n) + np.bincount(dst, minlength=n)
+    udeg, cnt = np.unique(deg, return_counts=True)
+    interior_deg = int(udeg[int(np.argmax(cnt))]) if len(udeg) > 0 else 8
+    cand = np.flatnonzero(deg < interior_deg).astype(np.int64)
+    if cand.size < max(32, infer_min_nodes):
+        raise RuntimeError(
+            f"Too few candidate boundary nodes for inference (cand={cand.size}, interior_deg={interior_deg})."
+        )
+
+    cand_mask = np.zeros((n,), dtype=bool)
+    cand_mask[cand] = True
+    valid = cand_mask[src] & cand_mask[dst]
+    es = src[valid]
+    ed = dst[valid]
+
+    # Build compact node-id mapping for candidate subgraph.
+    id_of = -np.ones((n,), dtype=np.int64)
+    id_of[cand] = np.arange(cand.size, dtype=np.int64)
+    cs = id_of[es]
+    cd = id_of[ed]
+    good = (cs >= 0) & (cd >= 0)
+    cs = cs[good]
+    cd = cd[good]
+
+    m = int(cand.size)
+    adj: List[List[int]] = [[] for _ in range(m)]
+    for u, v in zip(cs.tolist(), cd.tolist()):
+        if v not in adj[u]:
+            adj[u].append(v)
+        if u not in adj[v]:
+            adj[v].append(u)
+
+    # Connected components on candidate boundary graph.
+    seen = np.zeros((m,), dtype=bool)
+    comps: List[np.ndarray] = []
+    for i in range(m):
+        if seen[i]:
+            continue
+        stack = [i]
+        seen[i] = True
+        out: List[int] = []
+        while stack:
+            a = stack.pop()
+            out.append(a)
+            for b in adj[a]:
+                if not seen[b]:
+                    seen[b] = True
+                    stack.append(b)
+        comps.append(np.asarray(out, dtype=np.int64))
+
+    if len(comps) == 0:
+        raise RuntimeError("No connected components found for boundary candidates.")
+
+    x = pxy[:, 0]
+    y = pxy[:, 1]
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    y_min = float(np.min(y))
+    y_max = float(np.max(y))
+    span = max(1e-6, min(x_max - x_min, y_max - y_min))
+    edge_eps = 0.01 * span
+
+    best_nodes: Optional[np.ndarray] = None
+    best_size = -1
+
+    # Prefer the largest non-outer boundary component (typically cylinder loop).
+    for comp in comps:
+        if int(comp.size) < int(infer_min_nodes):
+            continue
+        nodes = cand[comp]
+        cx = x[nodes]
+        cy = y[nodes]
+        touches_outer = (
+            (float(np.min(cx)) <= (x_min + edge_eps))
+            or (float(np.max(cx)) >= (x_max - edge_eps))
+            or (float(np.min(cy)) <= (y_min + edge_eps))
+            or (float(np.max(cy)) >= (y_max - edge_eps))
+        )
+        if touches_outer:
+            continue
+        if int(nodes.size) > best_size:
+            best_nodes = nodes
+            best_size = int(nodes.size)
+
+    # Fallback: smallest large component by bbox area (often interior hole boundary).
+    if best_nodes is None:
+        best_area = None
+        for comp in comps:
+            if int(comp.size) < int(infer_min_nodes):
+                continue
+            nodes = cand[comp]
+            cx = x[nodes]
+            cy = y[nodes]
+            area = float((np.max(cx) - np.min(cx)) * (np.max(cy) - np.min(cy)))
+            if best_area is None or area < best_area:
+                best_area = area
+                best_nodes = nodes
+        if best_nodes is None:
+            raise RuntimeError("Could not identify an interior boundary component for cylinder inference.")
+
+    bx = x[best_nodes]
+    by = y[best_nodes]
+    cxi = float(np.mean(bx))
+    cyi = float(np.mean(by))
+    rr = np.sqrt((bx - cxi) ** 2 + (by - cyi) ** 2)
+    rad = float(np.mean(rr))
+    rstd = float(np.std(rr))
+    if not np.isfinite(rad) or rad <= 0.0:
+        raise RuntimeError("Inferred cylinder radius is invalid.")
+
+    # Estimate geometric spacing from boundary edges in the selected component.
+    comp_mask = np.zeros((n,), dtype=bool)
+    comp_mask[best_nodes] = True
+    ecomp = comp_mask[src] & comp_mask[dst]
+    if np.any(ecomp):
+        dxy = pxy[dst[ecomp], :] - pxy[src[ecomp], :]
+        elen = np.sqrt(np.sum(dxy * dxy, axis=1))
+        edge_med = float(np.median(elen)) if elen.size > 0 else 0.0
+    else:
+        edge_med = 0.0
+    band = float(max(3.0 * rstd, float(infer_band_scale) * edge_med, 1e-6))
+
+    return {
+        "center_x": cxi,
+        "center_y": cyi,
+        "radius": rad,
+        "band": band,
+    }
+
+
+def _boundary_infer_cache_key(pos: torch.Tensor, edge_index: torch.Tensor) -> Tuple[Any, ...]:
+    pxy = pos[:, :2]
+    x_min = float(pxy[:, 0].min().item())
+    x_max = float(pxy[:, 0].max().item())
+    y_min = float(pxy[:, 1].min().item())
+    y_max = float(pxy[:, 1].max().item())
+    ei = edge_index
+    if ei.ndim == 2 and ei.size(0) == 2:
+        e = int(ei.size(1))
+    elif ei.ndim == 2 and ei.size(1) == 2:
+        e = int(ei.size(0))
+    else:
+        e = int(ei.numel())
+    return (
+        int(pos.size(0)),
+        int(pos.size(1)),
+        int(e),
+        round(x_min, 5),
+        round(x_max, 5),
+        round(y_min, 5),
+        round(y_max, 5),
+    )
+
+
+def _build_boundary_mask_node_feature(
+    *,
+    pos: torch.Tensor,
+    edge_index: Optional[torch.Tensor],
+    cfg: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    bcfg = _boundary_mask_cfg(cfg)
+    if not bool(bcfg.get("enabled", False)):
+        return None
+
+    if pos.ndim != 2 or int(pos.size(1)) < 2:
+        raise ValueError(
+            f"Boundary mask input requires positions with at least 2 columns; got shape {tuple(pos.shape)}"
+        )
+
+    pxy = pos[:, :2].to(device=device, dtype=torch.float32)
+    if bool(bcfg.get("infer_from_data", False)):
+        if edge_index is None:
+            raise RuntimeError("Boundary mask inference requires edge_index, but none was provided.")
+        key = _boundary_infer_cache_key(pos, edge_index)
+        if key in _BOUNDARY_INFER_CACHE:
+            inf = _BOUNDARY_INFER_CACHE[key]
+        else:
+            inf = _infer_cylinder_params_from_geometry(
+                pos=pos,
+                edge_index=edge_index,
+                infer_band_scale=float(bcfg.get("infer_band_scale", 1.5)),
+                infer_min_nodes=int(bcfg.get("infer_min_nodes", 16)),
+            )
+            _BOUNDARY_INFER_CACHE[key] = inf
+            if len(_BOUNDARY_INFER_CACHE) > 32:
+                _BOUNDARY_INFER_CACHE.pop(next(iter(_BOUNDARY_INFER_CACHE)))
+        cxy = torch.tensor([inf["center_x"], inf["center_y"]], device=device, dtype=torch.float32).view(1, 2)
+        radius = float(inf["radius"])
+        band = float(inf["band"])
+    else:
+        cxy = torch.tensor(bcfg["center_xy"], device=device, dtype=torch.float32).view(1, 2)
+        radius = float(bcfg["radius"])
+        band = float(bcfg["band"])
+    rad = torch.linalg.norm(pxy - cxy, dim=1)
+    mask = (torch.abs(rad - radius) <= band).to(dtype=dtype).view(-1, 1)
+    return mask
 
 
 def _load_torch_object(path_or_buf: Any, map_location: str = "cpu") -> Any:
@@ -1975,6 +2277,15 @@ def _run_epoch(
         )
         if re_extra is not None and re_extra.numel() > 0:
             x_parts.append(re_extra)
+        bnd_extra = _build_boundary_mask_node_feature(
+            pos=pos,
+            edge_index=ei,
+            cfg=cfg,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if bnd_extra is not None and bnd_extra.numel() > 0:
+            x_parts.append(bnd_extra)
         if include_pos:
             x_parts.append(pos_in)
 
@@ -2123,6 +2434,15 @@ def _run_epoch_multi_step(
             )
             if re_extra is not None and re_extra.numel() > 0:
                 x_parts.append(re_extra)
+            bnd_extra = _build_boundary_mask_node_feature(
+                pos=pos,
+                edge_index=ei,
+                cfg=cfg,
+                device=device,
+                dtype=x_in.dtype,
+            )
+            if bnd_extra is not None and bnd_extra.numel() > 0:
+                x_parts.append(bnd_extra)
             if include_pos:
                 x_parts.append(pos_in)
             phy_extra = _build_physics_extra_features(
@@ -2256,6 +2576,8 @@ def main(config_path: str) -> None:
 
     include_pos = bool(feat_cfg.get("include_pos", True))
     include_reynolds, reynolds_mode = _reynolds_input_cfg(cfg)
+    bmask_cfg = _boundary_mask_cfg(cfg)
+    include_boundary_mask = bool(bmask_cfg.get("enabled", False))
     normalize = bool(feat_cfg.get("normalize", True))
     norm_mode = _normalization_mode_from_cfg(cfg)
     pos_normalize, pos_norm_mode = _pos_normalization_cfg(cfg)
@@ -2363,6 +2685,7 @@ def main(config_path: str) -> None:
     in_dim = (
         dataset_for_dims.x_dim
         + (1 if include_reynolds else 0)
+        + (1 if include_boundary_mask else 0)
         + (dataset_for_dims.pos_dim if include_pos else 0)
         + int(physics_extra_dim)
     )
@@ -2452,6 +2775,22 @@ def main(config_path: str) -> None:
         print(f"[INFO] position normalization disabled (configured mode={pos_norm_mode}).")
     if include_reynolds:
         print(f"[INFO] Reynolds conditioning enabled: mode={reynolds_mode} (channel_dim=1).")
+    if include_boundary_mask:
+        if bool(bmask_cfg.get("infer_from_data", False)):
+            print(
+                "[INFO] boundary mask input enabled: "
+                f"type={bmask_cfg.get('type','cylinder')} infer_from_data=true "
+                f"infer_band_scale={float(bmask_cfg.get('infer_band_scale',1.5))} "
+                f"infer_min_nodes={int(bmask_cfg.get('infer_min_nodes',16))}"
+            )
+        else:
+            print(
+                "[INFO] boundary mask input enabled: "
+                f"type={bmask_cfg.get('type','cylinder')} "
+                f"center={bmask_cfg.get('center_xy',[0.0,0.0])} "
+                f"radius={float(bmask_cfg.get('radius',0.5))} "
+                f"band={float(bmask_cfg.get('band',0.08))}"
+            )
     if _physics_inputs_enabled(cfg):
         print(
             f"[INFO] physics inputs enabled: backend={_physics_backend(cfg)} "
@@ -2660,6 +2999,14 @@ def main(config_path: str) -> None:
                 "pos_normalization_mode": str(pos_norm_mode),
                 "include_reynolds": bool(include_reynolds),
                 "reynolds_mode": str(reynolds_mode),
+                "include_boundary_mask": bool(include_boundary_mask),
+                "boundary_mask_type": str(bmask_cfg.get("type", "cylinder")),
+                "boundary_mask_infer_from_data": bool(bmask_cfg.get("infer_from_data", False)),
+                "boundary_mask_infer_band_scale": float(bmask_cfg.get("infer_band_scale", 1.5)),
+                "boundary_mask_infer_min_nodes": int(bmask_cfg.get("infer_min_nodes", 16)),
+                "boundary_mask_center_xy": [float(x) for x in bmask_cfg.get("center_xy", [0.0, 0.0])],
+                "boundary_mask_radius": float(bmask_cfg.get("radius", 0.5)),
+                "boundary_mask_band": float(bmask_cfg.get("band", 0.08)),
                 "normalize": bool(normalize),
                 "normalization_mode": str(norm_mode),
                 "component_scale_mode": str(component_mode),

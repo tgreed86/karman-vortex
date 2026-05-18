@@ -30,6 +30,17 @@
       "mode": "log",
       "_comment_mode": "Options: 'log' -> log10(Re), 'nu' -> 1/Re"
     },
+    "boundary_mask_input": {
+      "enabled": false,
+      "type": "cylinder",
+      "infer_from_data": false,
+      "infer_band_scale": 1.5,
+      "infer_min_nodes": 16,
+      "center_xy": [0.0, 0.0],
+      "radius": 0.5,
+      "band": 0.08,
+      "_comment": "Adds one binary channel: 1 where abs(r-radius)<=band around center_xy. If infer_from_data=true, center/radius/band are inferred from pos+edge_index."
+    },
     "include_pos": true,
     "pos_columns": [0, 1],
 
