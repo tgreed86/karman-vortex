@@ -33,19 +33,41 @@
     "boundary_mask_input": {
       "enabled": false,
       "type": "cylinder",
+      "feature_mode": "signed_distance",
+      "_comment_feature_mode": "Options: 'mask', 'signed_distance', 'unsigned_distance', 'mask_signed_distance', 'mask_unsigned_distance'",
+      "distance_scale": "band",
+      "_comment_distance_scale": "Options: 'none', 'band', 'radius'. For signed/unsigned distance modes, divides distance by this scale.",
+      "distance_clip": 3.0,
       "infer_from_data": false,
       "infer_band_scale": 1.5,
       "infer_min_nodes": 16,
       "center_xy": [0.0, 0.0],
       "radius": 0.5,
       "band": 0.08,
-      "_comment": "Adds one binary channel: 1 where abs(r-radius)<=band around center_xy. If infer_from_data=true, center/radius/band are inferred from pos+edge_index."
+      "_comment": "Boundary geometry channels for the cylinder. In distance modes, signed/unsigned distance is computed from r-radius. If infer_from_data=true, center/radius/band are inferred from pos+edge_index."
     },
-    "include_pos": true,
+    "relative_geometry_input": {
+      "enabled": true,
+      "channels": ["domain_distances", "cylinder_signed_distance"],
+      "_comment_channels": "domain_distances gives normalized distances to xmin/xmax/ymin/ymax; cylinder_signed_distance gives signed distance from the cylinder boundary.",
+      "domain_bbox": [-5.0, 15.0, -5.0, 5.0],
+      "_comment_domain_bbox": "Use null or 'auto' to infer [xmin,xmax,ymin,ymax] from each static mesh.",
+      "domain_distance_clip": null,
+      "cylinder_distance_scale": "radius",
+      "_comment_cylinder_distance_scale": "Options: 'none', 'radius', 'band', or 'domain'.",
+      "cylinder_distance_clip": 10.0,
+      "center_xy": [0.0, 0.0],
+      "radius": 0.5,
+      "band": 0.08,
+      "infer_from_data": false,
+      "infer_band_scale": 1.5,
+      "infer_min_nodes": 16
+    },
+    "include_pos": false,
     "pos_columns": [0, 1],
 
     "pos_normalization": {
-      "enabled": true,
+      "enabled": false,
       "mode": "minmax_11",
       "_comment_mode": "Options: 'zscore' or 'minmax_11'; applied only to GNN input pos channels."
     }
@@ -58,8 +80,8 @@
   },
 
   "train": {
-    "epochs": 5,
-    "validation_every_epochs": 1,
+    "epochs": 200,
+    "validation_every_epochs": 5,
     "batch_size": 1,
     "lr": 0.0005,
     "weight_decay": 0.0,
@@ -67,7 +89,7 @@
     "window_size": 5,
     "stride": 1,
     "autoregressive": true,
-    "save_dir": "./runs_karman_basic/test"
+    "save_dir": "./runs_karman_basic/from_jinyoungs_files/no_physics/minmax_11-norm/with_reynolds/200ep/"
   },
 
   "model": {
@@ -84,7 +106,7 @@
 
   "physics": {
     "physics_backend": "dec",
-    "parc_include_adv": true,
+    "parc_include_adv": false,
     "parc_include_diff": false,
     "advection_type": "scalar",
     "velocity_channels": [0, 1],

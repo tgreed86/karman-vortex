@@ -42,6 +42,7 @@ from models import FeatureNet
 from train_basic_point import (
     _build_boundary_mask_node_feature,
     _build_physics_extra_features,
+    _build_relative_geometry_node_features,
     _build_reynolds_node_feature,
     _infer_reynolds_number,
     _physics_inputs_enabled,
@@ -732,10 +733,10 @@ def run_rollout(
         x_abs_dev = x_in_abs.to(device=device, dtype=torch.float32)
         x_in = _maybe_norm(x_abs_dev, norm_x_mu, norm_x_std)
         pos_dev = pos_t.to(device=device, dtype=torch.float32)
-        pos_in = _maybe_norm(pos_dev, norm_pos_mu, norm_pos_std)
         ei_dev = ei_t.to(device=device, dtype=torch.long)
 
         include_pos = bool(feat_cfg.get("include_pos", True))
+        pos_in = _maybe_norm(pos_dev, norm_pos_mu, norm_pos_std) if include_pos else None
         x_parts = [x_in]
         re_extra = _build_reynolds_node_feature(
             n_nodes=int(x_in.size(0)),
@@ -747,6 +748,15 @@ def run_rollout(
         )
         if re_extra is not None and re_extra.numel() > 0:
             x_parts.append(re_extra)
+        rel_geo = _build_relative_geometry_node_features(
+            pos=pos_dev,
+            edge_index=ei_dev,
+            cfg=cfg,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if rel_geo is not None and rel_geo.numel() > 0:
+            x_parts.append(rel_geo)
         bnd_extra = _build_boundary_mask_node_feature(
             pos=pos_dev,
             edge_index=ei_dev,
@@ -757,6 +767,7 @@ def run_rollout(
         if bnd_extra is not None and bnd_extra.numel() > 0:
             x_parts.append(bnd_extra)
         if include_pos:
+            assert pos_in is not None
             x_parts.append(pos_in)
         if physics_inputs_enabled:
             dt_phys = _safe_dt_scalar(s_t.get("time", None), s_tp1.get("time", None), default_dt=1.0)
@@ -774,11 +785,14 @@ def run_rollout(
                 x_parts.append(phy_extra)
         x_model = torch.cat(x_parts, dim=1)
         if expected_in_dim is not None and expected_in_dim > 0 and int(x_model.size(1)) != int(expected_in_dim):
+            bnd_ch = 0 if bnd_extra is None else int(bnd_extra.size(1))
+            rel_ch = 0 if rel_geo is None else int(rel_geo.size(1))
             raise RuntimeError(
                 "Rollout input dim mismatch: "
                 f"built {int(x_model.size(1))} channels, but checkpoint expects {int(expected_in_dim)}. "
                 f"(include_pos={include_pos}, physics_inputs_enabled={physics_inputs_enabled}, "
-                f"reynolds_input={re_extra is not None}, boundary_mask_input={bnd_extra is not None})"
+                f"reynolds_input={re_extra is not None}, relative_geometry_channels={rel_ch}, "
+                f"boundary_geom_channels={bnd_ch})"
             )
 
         with torch.no_grad():

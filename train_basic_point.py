@@ -310,6 +310,9 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     enabled_raw = feats.get("include_boundary_mask", False)
     btype_raw: Any = "cylinder"
+    feature_mode_raw: Any = "mask"
+    distance_scale_raw: Any = "band"
+    distance_clip_raw: Any = None
     center_raw: Any = [0.0, 0.0]
     radius_raw: Any = 0.5
     band_raw: Any = 0.08
@@ -320,6 +323,9 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(blk, dict):
         enabled_raw = blk.get("enabled", enabled_raw)
         btype_raw = blk.get("type", blk.get("boundary_type", btype_raw))
+        feature_mode_raw = blk.get("feature_mode", blk.get("mode", feature_mode_raw))
+        distance_scale_raw = blk.get("distance_scale", blk.get("distance_norm", distance_scale_raw))
+        distance_clip_raw = blk.get("distance_clip", distance_clip_raw)
         center_raw = blk.get("center_xy", blk.get("center", center_raw))
         radius_raw = blk.get("radius", radius_raw)
         band_raw = blk.get("band", blk.get("tolerance", band_raw))
@@ -331,6 +337,12 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     if "boundary_mask_type" in feats:
         btype_raw = feats.get("boundary_mask_type", btype_raw)
+    if "boundary_mask_feature_mode" in feats:
+        feature_mode_raw = feats.get("boundary_mask_feature_mode", feature_mode_raw)
+    if "boundary_mask_distance_scale" in feats:
+        distance_scale_raw = feats.get("boundary_mask_distance_scale", distance_scale_raw)
+    if "boundary_mask_distance_clip" in feats:
+        distance_clip_raw = feats.get("boundary_mask_distance_clip", distance_clip_raw)
     if "boundary_mask_center" in feats:
         center_raw = feats.get("boundary_mask_center", center_raw)
     if "boundary_mask_radius" in feats:
@@ -342,6 +354,25 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     enabled = bool(enabled_raw)
     btype = str(btype_raw).strip().lower()
+    feature_mode = str(feature_mode_raw).strip().lower().replace("-", "_").replace("+", "_")
+    if feature_mode in ("distance", "signed", "signed_dist", "signed_distance"):
+        feature_mode = "signed_distance"
+    elif feature_mode in ("unsigned", "unsigned_dist", "unsigned_distance"):
+        feature_mode = "unsigned_distance"
+    elif feature_mode in ("mask_signed_distance", "signed_distance_mask", "mask_signed"):
+        feature_mode = "mask_signed_distance"
+    elif feature_mode in ("mask_unsigned_distance", "unsigned_distance_mask", "mask_unsigned"):
+        feature_mode = "mask_unsigned_distance"
+    elif feature_mode in ("mask_only",):
+        feature_mode = "mask"
+
+    distance_scale = str(distance_scale_raw).strip().lower().replace("-", "_")
+    if distance_scale in ("", "off"):
+        distance_scale = "none"
+    if distance_scale in ("tol", "tolerance"):
+        distance_scale = "band"
+
+    distance_clip = _as_optional_float(distance_clip_raw)
     infer_from_data = bool(infer_raw)
 
     if isinstance(center_raw, (list, tuple)) and len(center_raw) >= 2:
@@ -359,6 +390,25 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if enabled:
         if btype != "cylinder":
             raise ValueError("features.boundary_mask_input.type currently supports only 'cylinder'.")
+        valid_modes = {
+            "mask",
+            "signed_distance",
+            "unsigned_distance",
+            "mask_signed_distance",
+            "mask_unsigned_distance",
+        }
+        if feature_mode not in valid_modes:
+            raise ValueError(
+                "features.boundary_mask_input.feature_mode must be one of "
+                f"{sorted(valid_modes)}, got '{feature_mode_raw}'."
+            )
+        if distance_scale not in ("none", "band", "radius"):
+            raise ValueError(
+                "features.boundary_mask_input.distance_scale must be one of "
+                "['none','band','radius']."
+            )
+        if distance_clip is not None and distance_clip <= 0.0:
+            raise ValueError("features.boundary_mask_input.distance_clip must be > 0 when provided.")
         if infer_from_data:
             if infer_band_scale <= 0.0:
                 raise ValueError("features.boundary_mask_input.infer_band_scale must be > 0.")
@@ -373,6 +423,9 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "enabled": enabled,
         "type": btype,
+        "feature_mode": feature_mode,
+        "distance_scale": distance_scale,
+        "distance_clip": distance_clip,
         "center_xy": [cx, cy],
         "radius": radius,
         "band": band,
@@ -380,6 +433,225 @@ def _boundary_mask_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "infer_band_scale": infer_band_scale,
         "infer_min_nodes": infer_min_nodes,
     }
+
+
+def _boundary_extra_in_channels(cfg: Dict[str, Any]) -> int:
+    bcfg = _boundary_mask_cfg(cfg)
+    if not bool(bcfg.get("enabled", False)):
+        return 0
+    mode = str(bcfg.get("feature_mode", "mask"))
+    if mode in ("mask", "signed_distance", "unsigned_distance"):
+        return 1
+    if mode in ("mask_signed_distance", "mask_unsigned_distance"):
+        return 2
+    return 1
+
+
+def _parse_relative_geometry_channels(raw: Any) -> List[str]:
+    if raw is None:
+        raw_items: List[Any] = ["domain_distances", "cylinder_signed_distance"]
+    elif isinstance(raw, str):
+        if raw.strip().lower() in ("default", "all"):
+            raw_items = ["domain_distances", "cylinder_signed_distance"]
+        else:
+            raw_items = [p for p in re.split(r"[,+\s]+", raw) if p]
+    elif isinstance(raw, (list, tuple)):
+        raw_items = list(raw)
+    else:
+        raise ValueError("features.relative_geometry_input.channels must be a string or list.")
+
+    out: List[str] = []
+    for item in raw_items:
+        name = str(item).strip().lower().replace("-", "_")
+        if name in (
+            "domain",
+            "domain_distance",
+            "domain_distances",
+            "outer_boundary_distances",
+            "boundary_distances",
+            "wall_distances",
+        ):
+            name = "domain_distances"
+        elif name in (
+            "cylinder_signed",
+            "cylinder_signed_distance",
+            "signed_cylinder_distance",
+            "obstacle_signed_distance",
+        ):
+            name = "cylinder_signed_distance"
+        elif name in (
+            "cylinder_unsigned",
+            "cylinder_unsigned_distance",
+            "unsigned_cylinder_distance",
+            "obstacle_unsigned_distance",
+        ):
+            name = "cylinder_unsigned_distance"
+        elif name in ("cylinder_normal", "obstacle_normal", "radial_unit_vector"):
+            name = "cylinder_normal"
+        else:
+            raise ValueError(
+                "Unsupported relative geometry channel "
+                f"'{item}'. Use domain_distances, cylinder_signed_distance, "
+                "cylinder_unsigned_distance, or cylinder_normal."
+            )
+        if name not in out:
+            out.append(name)
+    if len(out) == 0:
+        raise ValueError("features.relative_geometry_input.channels cannot be empty.")
+    return out
+
+
+def _parse_bbox(raw: Any, *, field_name: str) -> Optional[List[float]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "infer", "from_data"):
+        return None
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        vals = [float(v) for v in raw]
+        xmin, xmax, ymin, ymax = vals
+        if not all(np.isfinite(v) for v in vals):
+            raise ValueError(f"{field_name} must contain finite values.")
+        if xmax <= xmin or ymax <= ymin:
+            raise ValueError(f"{field_name} must be [xmin, xmax, ymin, ymax] with positive spans.")
+        return vals
+    raise ValueError(f"{field_name} must be [xmin, xmax, ymin, ymax], null, or 'auto'.")
+
+
+def _relative_geometry_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    feats = cfg.get("features", {}) or {}
+    blk = feats.get("relative_geometry_input", None)
+    bcfg = _boundary_mask_cfg(cfg)
+
+    enabled_raw = feats.get("include_relative_geometry", False)
+    channels_raw: Any = None
+    domain_bbox_raw: Any = cfg.get("data", {}).get("bbox", None)
+    domain_clip_raw: Any = None
+    cylinder_scale_raw: Any = "radius"
+    cylinder_clip_raw: Any = None
+    center_raw: Any = bcfg.get("center_xy", [0.0, 0.0])
+    radius_raw: Any = bcfg.get("radius", 0.5)
+    band_raw: Any = bcfg.get("band", 0.08)
+    infer_raw: Any = bcfg.get("infer_from_data", False)
+    infer_band_scale_raw: Any = bcfg.get("infer_band_scale", 1.5)
+    infer_min_nodes_raw: Any = bcfg.get("infer_min_nodes", 16)
+
+    if isinstance(blk, dict):
+        enabled_raw = blk.get("enabled", enabled_raw)
+        channels_raw = blk.get("channels", channels_raw)
+        domain_bbox_raw = blk.get("domain_bbox", blk.get("bbox", domain_bbox_raw))
+        domain_clip_raw = blk.get("domain_distance_clip", blk.get("distance_clip", domain_clip_raw))
+        cylinder_scale_raw = blk.get(
+            "cylinder_distance_scale",
+            blk.get("distance_scale", cylinder_scale_raw),
+        )
+        cylinder_clip_raw = blk.get(
+            "cylinder_distance_clip",
+            blk.get("distance_clip", cylinder_clip_raw),
+        )
+        center_raw = blk.get("center_xy", blk.get("center", center_raw))
+        radius_raw = blk.get("radius", radius_raw)
+        band_raw = blk.get("band", blk.get("tolerance", band_raw))
+        infer_raw = blk.get("infer_from_data", blk.get("infer", infer_raw))
+        infer_band_scale_raw = blk.get("infer_band_scale", infer_band_scale_raw)
+        infer_min_nodes_raw = blk.get("infer_min_nodes", infer_min_nodes_raw)
+    elif isinstance(blk, (bool, int)):
+        enabled_raw = bool(blk)
+
+    enabled = bool(enabled_raw)
+    if not enabled:
+        return {
+            "enabled": False,
+            "channels": [],
+            "domain_bbox": None,
+            "domain_distance_clip": None,
+            "cylinder_distance_scale": "radius",
+            "cylinder_distance_clip": None,
+            "center_xy": [0.0, 0.0],
+            "radius": 0.5,
+            "band": 0.08,
+            "infer_from_data": False,
+            "infer_band_scale": 1.5,
+            "infer_min_nodes": 16,
+        }
+
+    channels = _parse_relative_geometry_channels(channels_raw)
+    domain_bbox = _parse_bbox(domain_bbox_raw, field_name="features.relative_geometry_input.domain_bbox")
+    domain_clip = _as_optional_float(domain_clip_raw)
+    cylinder_clip = _as_optional_float(cylinder_clip_raw)
+
+    cylinder_scale = str(cylinder_scale_raw).strip().lower().replace("-", "_")
+    if cylinder_scale in ("", "off"):
+        cylinder_scale = "none"
+    if cylinder_scale in ("tol", "tolerance"):
+        cylinder_scale = "band"
+    if cylinder_scale in ("domain_short", "domain_min", "short_domain"):
+        cylinder_scale = "domain"
+    if cylinder_scale not in ("none", "radius", "band", "domain"):
+        raise ValueError(
+            "features.relative_geometry_input.cylinder_distance_scale must be one of "
+            "['none','radius','band','domain']."
+        )
+
+    if isinstance(center_raw, (list, tuple)) and len(center_raw) >= 2:
+        center_xy = [float(center_raw[0]), float(center_raw[1])]
+    else:
+        raise ValueError(
+            "features.relative_geometry_input.center_xy must be a list/tuple with two values [cx, cy]."
+        )
+    radius = float(radius_raw)
+    band = float(band_raw)
+    infer_band_scale = float(infer_band_scale_raw)
+    infer_min_nodes = int(infer_min_nodes_raw)
+    uses_cylinder = any(ch.startswith("cylinder_") for ch in channels)
+
+    if enabled:
+        if domain_clip is not None and domain_clip <= 0.0:
+            raise ValueError("features.relative_geometry_input.domain_distance_clip must be > 0 when provided.")
+        if cylinder_clip is not None and cylinder_clip <= 0.0:
+            raise ValueError("features.relative_geometry_input.cylinder_distance_clip must be > 0 when provided.")
+        if uses_cylinder:
+            if bool(infer_raw):
+                if infer_band_scale <= 0.0:
+                    raise ValueError("features.relative_geometry_input.infer_band_scale must be > 0.")
+                if infer_min_nodes < 8:
+                    raise ValueError("features.relative_geometry_input.infer_min_nodes must be >= 8.")
+            else:
+                if radius <= 0.0:
+                    raise ValueError("features.relative_geometry_input.radius must be > 0.")
+                if band <= 0.0:
+                    raise ValueError("features.relative_geometry_input.band must be > 0.")
+
+    return {
+        "enabled": enabled,
+        "channels": channels,
+        "domain_bbox": domain_bbox,
+        "domain_distance_clip": domain_clip,
+        "cylinder_distance_scale": cylinder_scale,
+        "cylinder_distance_clip": cylinder_clip,
+        "center_xy": center_xy,
+        "radius": radius,
+        "band": band,
+        "infer_from_data": bool(infer_raw),
+        "infer_band_scale": infer_band_scale,
+        "infer_min_nodes": infer_min_nodes,
+    }
+
+
+def _relative_geometry_in_channels(cfg: Dict[str, Any]) -> int:
+    rcfg = _relative_geometry_cfg(cfg)
+    if not bool(rcfg.get("enabled", False)):
+        return 0
+    dim = 0
+    for ch in rcfg.get("channels", []):
+        if ch == "domain_distances":
+            dim += 4
+        elif ch in ("cylinder_signed_distance", "cylinder_unsigned_distance"):
+            dim += 1
+        elif ch == "cylinder_normal":
+            dim += 2
+        else:
+            raise ValueError(f"Unsupported relative geometry channel: {ch}")
+    return dim
 
 
 def _infer_cylinder_params_from_geometry(
@@ -559,6 +831,41 @@ def _boundary_infer_cache_key(pos: torch.Tensor, edge_index: torch.Tensor) -> Tu
     )
 
 
+def _resolve_cylinder_geometry(
+    *,
+    pos: torch.Tensor,
+    edge_index: Optional[torch.Tensor],
+    device: torch.device,
+    center_xy: Sequence[float],
+    radius: float,
+    band: float,
+    infer_from_data: bool,
+    infer_band_scale: float,
+    infer_min_nodes: int,
+) -> Tuple[torch.Tensor, float, float]:
+    if bool(infer_from_data):
+        if edge_index is None:
+            raise RuntimeError("Cylinder geometry inference requires edge_index, but none was provided.")
+        key = _boundary_infer_cache_key(pos, edge_index)
+        if key in _BOUNDARY_INFER_CACHE:
+            inf = _BOUNDARY_INFER_CACHE[key]
+        else:
+            inf = _infer_cylinder_params_from_geometry(
+                pos=pos,
+                edge_index=edge_index,
+                infer_band_scale=float(infer_band_scale),
+                infer_min_nodes=int(infer_min_nodes),
+            )
+            _BOUNDARY_INFER_CACHE[key] = inf
+            if len(_BOUNDARY_INFER_CACHE) > 32:
+                _BOUNDARY_INFER_CACHE.pop(next(iter(_BOUNDARY_INFER_CACHE)))
+        cxy = torch.tensor([inf["center_x"], inf["center_y"]], device=device, dtype=torch.float32).view(1, 2)
+        return cxy, float(inf["radius"]), float(inf["band"])
+
+    cxy = torch.tensor(center_xy, device=device, dtype=torch.float32).view(1, 2)
+    return cxy, float(radius), float(band)
+
+
 def _build_boundary_mask_node_feature(
     *,
     pos: torch.Tensor,
@@ -577,32 +884,163 @@ def _build_boundary_mask_node_feature(
         )
 
     pxy = pos[:, :2].to(device=device, dtype=torch.float32)
-    if bool(bcfg.get("infer_from_data", False)):
-        if edge_index is None:
-            raise RuntimeError("Boundary mask inference requires edge_index, but none was provided.")
-        key = _boundary_infer_cache_key(pos, edge_index)
-        if key in _BOUNDARY_INFER_CACHE:
-            inf = _BOUNDARY_INFER_CACHE[key]
-        else:
-            inf = _infer_cylinder_params_from_geometry(
-                pos=pos,
-                edge_index=edge_index,
-                infer_band_scale=float(bcfg.get("infer_band_scale", 1.5)),
-                infer_min_nodes=int(bcfg.get("infer_min_nodes", 16)),
-            )
-            _BOUNDARY_INFER_CACHE[key] = inf
-            if len(_BOUNDARY_INFER_CACHE) > 32:
-                _BOUNDARY_INFER_CACHE.pop(next(iter(_BOUNDARY_INFER_CACHE)))
-        cxy = torch.tensor([inf["center_x"], inf["center_y"]], device=device, dtype=torch.float32).view(1, 2)
-        radius = float(inf["radius"])
-        band = float(inf["band"])
-    else:
-        cxy = torch.tensor(bcfg["center_xy"], device=device, dtype=torch.float32).view(1, 2)
-        radius = float(bcfg["radius"])
-        band = float(bcfg["band"])
+    cxy, radius, band = _resolve_cylinder_geometry(
+        pos=pos,
+        edge_index=edge_index,
+        device=device,
+        center_xy=bcfg["center_xy"],
+        radius=float(bcfg["radius"]),
+        band=float(bcfg["band"]),
+        infer_from_data=bool(bcfg.get("infer_from_data", False)),
+        infer_band_scale=float(bcfg.get("infer_band_scale", 1.5)),
+        infer_min_nodes=int(bcfg.get("infer_min_nodes", 16)),
+    )
     rad = torch.linalg.norm(pxy - cxy, dim=1)
-    mask = (torch.abs(rad - radius) <= band).to(dtype=dtype).view(-1, 1)
-    return mask
+    signed_dist = rad - float(radius)
+    unsigned_dist = torch.abs(signed_dist)
+    mask = (unsigned_dist <= float(band)).to(dtype=dtype).view(-1, 1)
+
+    mode = str(bcfg.get("feature_mode", "mask"))
+    out: List[torch.Tensor] = []
+    if mode in ("mask", "mask_signed_distance", "mask_unsigned_distance"):
+        out.append(mask)
+
+    if mode in ("signed_distance", "mask_signed_distance"):
+        dist = signed_dist
+    elif mode in ("unsigned_distance", "mask_unsigned_distance"):
+        dist = unsigned_dist
+    else:
+        dist = None
+
+    if dist is not None:
+        scale_mode = str(bcfg.get("distance_scale", "band"))
+        if scale_mode == "band":
+            scale = max(float(abs(band)), 1e-12)
+        elif scale_mode == "radius":
+            scale = max(float(abs(radius)), 1e-12)
+        else:
+            scale = 1.0
+        d = dist / float(scale)
+
+        dclip = bcfg.get("distance_clip", None)
+        if dclip is not None:
+            c = float(dclip)
+            if mode in ("signed_distance", "mask_signed_distance"):
+                d = torch.clamp(d, min=-c, max=c)
+            else:
+                d = torch.clamp(d, min=0.0, max=c)
+        out.append(d.to(dtype=dtype).view(-1, 1))
+
+    if len(out) == 0:
+        return None
+    if len(out) == 1:
+        return out[0]
+    return torch.cat(out, dim=1)
+
+
+def _build_relative_geometry_node_features(
+    *,
+    pos: torch.Tensor,
+    edge_index: Optional[torch.Tensor],
+    cfg: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    rcfg = _relative_geometry_cfg(cfg)
+    if not bool(rcfg.get("enabled", False)):
+        return None
+    if pos.ndim != 2 or int(pos.size(1)) < 2:
+        raise ValueError(
+            f"Relative geometry input requires positions with at least 2 columns; got shape {tuple(pos.shape)}"
+        )
+
+    pxy = pos[:, :2].to(device=device, dtype=torch.float32)
+    x = pxy[:, 0]
+    y = pxy[:, 1]
+    bbox = rcfg.get("domain_bbox", None)
+    if bbox is None:
+        xmin = float(x.min().item())
+        xmax = float(x.max().item())
+        ymin = float(y.min().item())
+        ymax = float(y.max().item())
+    else:
+        xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+
+    x_span = max(float(xmax - xmin), 1e-12)
+    y_span = max(float(ymax - ymin), 1e-12)
+    domain_scale = max(min(x_span, y_span), 1e-12)
+
+    out: List[torch.Tensor] = []
+    channels = list(rcfg.get("channels", []))
+    if "domain_distances" in channels:
+        domain = torch.stack(
+            [
+                (x - float(xmin)) / x_span,
+                (float(xmax) - x) / x_span,
+                (y - float(ymin)) / y_span,
+                (float(ymax) - y) / y_span,
+            ],
+            dim=1,
+        )
+        dclip = rcfg.get("domain_distance_clip", None)
+        if dclip is not None:
+            domain = torch.clamp(domain, min=0.0, max=float(dclip))
+        out.append(domain.to(dtype=dtype))
+
+    needs_cylinder = any(ch in channels for ch in (
+        "cylinder_signed_distance",
+        "cylinder_unsigned_distance",
+        "cylinder_normal",
+    ))
+    if needs_cylinder:
+        cxy, radius, band = _resolve_cylinder_geometry(
+            pos=pos,
+            edge_index=edge_index,
+            device=device,
+            center_xy=rcfg["center_xy"],
+            radius=float(rcfg["radius"]),
+            band=float(rcfg["band"]),
+            infer_from_data=bool(rcfg.get("infer_from_data", False)),
+            infer_band_scale=float(rcfg.get("infer_band_scale", 1.5)),
+            infer_min_nodes=int(rcfg.get("infer_min_nodes", 16)),
+        )
+        rel = pxy - cxy
+        rad = torch.linalg.norm(rel, dim=1)
+        signed_dist = rad - float(radius)
+
+        scale_mode = str(rcfg.get("cylinder_distance_scale", "radius"))
+        if scale_mode == "band":
+            scale = max(float(abs(band)), 1e-12)
+        elif scale_mode == "radius":
+            scale = max(float(abs(radius)), 1e-12)
+        elif scale_mode == "domain":
+            scale = domain_scale
+        else:
+            scale = 1.0
+
+        cclip = rcfg.get("cylinder_distance_clip", None)
+        if "cylinder_signed_distance" in channels:
+            d = signed_dist / float(scale)
+            if cclip is not None:
+                c = float(cclip)
+                d = torch.clamp(d, min=-c, max=c)
+            out.append(d.to(dtype=dtype).view(-1, 1))
+
+        if "cylinder_unsigned_distance" in channels:
+            d = torch.abs(signed_dist) / float(scale)
+            if cclip is not None:
+                d = torch.clamp(d, min=0.0, max=float(cclip))
+            out.append(d.to(dtype=dtype).view(-1, 1))
+
+        if "cylinder_normal" in channels:
+            nrm = rel / rad.clamp_min(1e-12).view(-1, 1)
+            out.append(nrm.to(dtype=dtype))
+
+    if len(out) == 0:
+        return None
+    if len(out) == 1:
+        return out[0]
+    return torch.cat(out, dim=1)
 
 
 def _load_torch_object(path_or_buf: Any, map_location: str = "cpu") -> Any:
@@ -2264,7 +2702,7 @@ def _run_epoch(
 
         x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
         y_tgt = _maybe_norm(y, norm.y_mu, norm.y_std)
-        pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std)
+        pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std) if include_pos else None
 
         x_parts = [x_in]
         re_extra = _build_reynolds_node_feature(
@@ -2277,6 +2715,15 @@ def _run_epoch(
         )
         if re_extra is not None and re_extra.numel() > 0:
             x_parts.append(re_extra)
+        rel_geo = _build_relative_geometry_node_features(
+            pos=pos,
+            edge_index=ei,
+            cfg=cfg,
+            device=device,
+            dtype=x_in.dtype,
+        )
+        if rel_geo is not None and rel_geo.numel() > 0:
+            x_parts.append(rel_geo)
         bnd_extra = _build_boundary_mask_node_feature(
             pos=pos,
             edge_index=ei,
@@ -2287,6 +2734,7 @@ def _run_epoch(
         if bnd_extra is not None and bnd_extra.numel() > 0:
             x_parts.append(bnd_extra)
         if include_pos:
+            assert pos_in is not None
             x_parts.append(pos_in)
 
         phy_extra = _build_physics_extra_features(
@@ -2417,7 +2865,7 @@ def _run_epoch_multi_step(
 
             x_in = _maybe_norm(x_in_abs, norm.x_mu, norm.x_std)
             y_tgt = _maybe_norm(y_tgt_abs, norm.y_mu, norm.y_std)
-            pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std)
+            pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std) if include_pos else None
             if isinstance(t_list, list) and (k + 1) < len(t_list):
                 dt_phys = _safe_dt_scalar(t_list[k], t_list[k + 1], default_dt=1.0)
             else:
@@ -2434,6 +2882,15 @@ def _run_epoch_multi_step(
             )
             if re_extra is not None and re_extra.numel() > 0:
                 x_parts.append(re_extra)
+            rel_geo = _build_relative_geometry_node_features(
+                pos=pos,
+                edge_index=ei,
+                cfg=cfg,
+                device=device,
+                dtype=x_in.dtype,
+            )
+            if rel_geo is not None and rel_geo.numel() > 0:
+                x_parts.append(rel_geo)
             bnd_extra = _build_boundary_mask_node_feature(
                 pos=pos,
                 edge_index=ei,
@@ -2444,6 +2901,7 @@ def _run_epoch_multi_step(
             if bnd_extra is not None and bnd_extra.numel() > 0:
                 x_parts.append(bnd_extra)
             if include_pos:
+                assert pos_in is not None
                 x_parts.append(pos_in)
             phy_extra = _build_physics_extra_features(
                 x_abs=x_in_abs,
@@ -2576,8 +3034,12 @@ def main(config_path: str) -> None:
 
     include_pos = bool(feat_cfg.get("include_pos", True))
     include_reynolds, reynolds_mode = _reynolds_input_cfg(cfg)
+    relative_geometry_cfg = _relative_geometry_cfg(cfg)
+    include_relative_geometry = bool(relative_geometry_cfg.get("enabled", False))
+    relative_geometry_dim = _relative_geometry_in_channels(cfg)
     bmask_cfg = _boundary_mask_cfg(cfg)
     include_boundary_mask = bool(bmask_cfg.get("enabled", False))
+    boundary_extra_dim = _boundary_extra_in_channels(cfg)
     normalize = bool(feat_cfg.get("normalize", True))
     norm_mode = _normalization_mode_from_cfg(cfg)
     pos_normalize, pos_norm_mode = _pos_normalization_cfg(cfg)
@@ -2685,7 +3147,8 @@ def main(config_path: str) -> None:
     in_dim = (
         dataset_for_dims.x_dim
         + (1 if include_reynolds else 0)
-        + (1 if include_boundary_mask else 0)
+        + int(relative_geometry_dim)
+        + int(boundary_extra_dim)
         + (dataset_for_dims.pos_dim if include_pos else 0)
         + int(physics_extra_dim)
     )
@@ -2775,18 +3238,37 @@ def main(config_path: str) -> None:
         print(f"[INFO] position normalization disabled (configured mode={pos_norm_mode}).")
     if include_reynolds:
         print(f"[INFO] Reynolds conditioning enabled: mode={reynolds_mode} (channel_dim=1).")
+    if include_relative_geometry:
+        print(
+            "[INFO] relative geometry input enabled: "
+            f"channels={list(relative_geometry_cfg.get('channels', []))} "
+            f"input_dim={relative_geometry_dim} "
+            f"domain_bbox={relative_geometry_cfg.get('domain_bbox', None)} "
+            f"cylinder_distance_scale={relative_geometry_cfg.get('cylinder_distance_scale', 'radius')} "
+            f"cylinder_distance_clip={relative_geometry_cfg.get('cylinder_distance_clip', None)} "
+            f"center={relative_geometry_cfg.get('center_xy', [0.0, 0.0])} "
+            f"radius={float(relative_geometry_cfg.get('radius', 0.5))}"
+        )
     if include_boundary_mask:
         if bool(bmask_cfg.get("infer_from_data", False)):
             print(
-                "[INFO] boundary mask input enabled: "
+                "[INFO] boundary geometry input enabled: "
                 f"type={bmask_cfg.get('type','cylinder')} infer_from_data=true "
+                f"feature_mode={bmask_cfg.get('feature_mode','mask')} "
+                f"distance_scale={bmask_cfg.get('distance_scale','band')} "
+                f"distance_clip={bmask_cfg.get('distance_clip',None)} "
+                f"channels={boundary_extra_dim} "
                 f"infer_band_scale={float(bmask_cfg.get('infer_band_scale',1.5))} "
                 f"infer_min_nodes={int(bmask_cfg.get('infer_min_nodes',16))}"
             )
         else:
             print(
-                "[INFO] boundary mask input enabled: "
+                "[INFO] boundary geometry input enabled: "
                 f"type={bmask_cfg.get('type','cylinder')} "
+                f"feature_mode={bmask_cfg.get('feature_mode','mask')} "
+                f"distance_scale={bmask_cfg.get('distance_scale','band')} "
+                f"distance_clip={bmask_cfg.get('distance_clip',None)} "
+                f"channels={boundary_extra_dim} "
                 f"center={bmask_cfg.get('center_xy',[0.0,0.0])} "
                 f"radius={float(bmask_cfg.get('radius',0.5))} "
                 f"band={float(bmask_cfg.get('band',0.08))}"
@@ -2997,10 +3479,31 @@ def main(config_path: str) -> None:
                 "include_pos": bool(include_pos),
                 "pos_normalize": bool(pos_normalize),
                 "pos_normalization_mode": str(pos_norm_mode),
+                "include_relative_geometry": bool(include_relative_geometry),
+                "relative_geometry_channels": list(relative_geometry_cfg.get("channels", [])),
+                "relative_geometry_input_channels": int(relative_geometry_dim),
+                "relative_geometry_domain_bbox": relative_geometry_cfg.get("domain_bbox", None),
+                "relative_geometry_domain_distance_clip": relative_geometry_cfg.get("domain_distance_clip", None),
+                "relative_geometry_cylinder_distance_scale": str(
+                    relative_geometry_cfg.get("cylinder_distance_scale", "radius")
+                ),
+                "relative_geometry_cylinder_distance_clip": relative_geometry_cfg.get("cylinder_distance_clip", None),
+                "relative_geometry_cylinder_infer_from_data": bool(
+                    relative_geometry_cfg.get("infer_from_data", False)
+                ),
+                "relative_geometry_cylinder_center_xy": [
+                    float(x) for x in relative_geometry_cfg.get("center_xy", [0.0, 0.0])
+                ],
+                "relative_geometry_cylinder_radius": float(relative_geometry_cfg.get("radius", 0.5)),
+                "relative_geometry_cylinder_band": float(relative_geometry_cfg.get("band", 0.08)),
                 "include_reynolds": bool(include_reynolds),
                 "reynolds_mode": str(reynolds_mode),
                 "include_boundary_mask": bool(include_boundary_mask),
                 "boundary_mask_type": str(bmask_cfg.get("type", "cylinder")),
+                "boundary_mask_feature_mode": str(bmask_cfg.get("feature_mode", "mask")),
+                "boundary_mask_distance_scale": str(bmask_cfg.get("distance_scale", "band")),
+                "boundary_mask_distance_clip": bmask_cfg.get("distance_clip", None),
+                "boundary_mask_input_channels": int(boundary_extra_dim),
                 "boundary_mask_infer_from_data": bool(bmask_cfg.get("infer_from_data", False)),
                 "boundary_mask_infer_band_scale": float(bmask_cfg.get("infer_band_scale", 1.5)),
                 "boundary_mask_infer_min_nodes": int(bmask_cfg.get("infer_min_nodes", 16)),
@@ -3066,6 +3569,8 @@ def main(config_path: str) -> None:
                 "reverse_time": bool(reverse_time),
                 "physics_inputs_enabled": bool(_physics_inputs_enabled(cfg)),
                 "physics_backend": _physics_backend(cfg),
+                "relative_geometry_input_channels": int(relative_geometry_dim),
+                "boundary_input_channels": int(boundary_extra_dim),
                 "physics_extra_in_channels": int(physics_extra_dim),
                 "model_in_dim": int(in_dim),
             },
@@ -3092,7 +3597,9 @@ def main(config_path: str) -> None:
             "x_dim": dataset_for_dims.x_dim,
             "y_dim": dataset_for_dims.y_dim,
             "pos_dim": dataset_for_dims.pos_dim,
+            "relative_geometry_input_channels": int(relative_geometry_dim),
             "physics_extra_in_channels": int(physics_extra_dim),
+            "boundary_input_channels": int(boundary_extra_dim),
             "model_in_dim": int(in_dim),
             "model_out_dim": int(out_dim),
         },
