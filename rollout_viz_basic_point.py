@@ -38,12 +38,13 @@ import matplotlib.tri as mtri
 import numpy as np
 import torch
 
-from models import FeatureNet
 from train_basic_point import (
     _build_boundary_mask_node_feature,
+    _build_model,
     _build_physics_extra_features,
     _build_relative_geometry_node_features,
     _build_reynolds_node_feature,
+    _forward_model,
     _infer_reynolds_number,
     _physics_inputs_enabled,
     _safe_dt_scalar,
@@ -384,19 +385,11 @@ def _to_opt_tensor(x: Any) -> Optional[torch.Tensor]:
     return torch.as_tensor(x, dtype=torch.float32)
 
 
-def _build_model_from_ckpt(ckpt: Dict[str, Any], cfg: Dict[str, Any], device: torch.device) -> FeatureNet:
+def _build_model_from_ckpt(ckpt: Dict[str, Any], cfg: Dict[str, Any], device: torch.device) -> torch.nn.Module:
     dims = ckpt.get("dims", {}) or {}
     in_dim = int(dims.get("in_dim"))
     out_dim = int(dims.get("out_dim"))
-    mcfg = cfg.get("model", {}) or {}
-    model = FeatureNet(
-        in_channels=in_dim,
-        out_channels=out_dim,
-        hidden=int(mcfg.get("hidden", 128)),
-        layers=int(mcfg.get("layers", 3)),
-        dropout=float(mcfg.get("dropout", 0.1)),
-        make_score_head=False,
-    ).to(device)
+    model = _build_model(cfg, in_dim=in_dim, out_dim=out_dim, device=device)
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state)
     model.eval()
@@ -628,7 +621,7 @@ def _enforce_gif_duration_ms(gif_path: str, duration_ms: int) -> bool:
 
 def run_rollout(
     *,
-    model: FeatureNet,
+    model: torch.nn.Module,
     steps: List[Dict[str, Any]],
     cfg: Dict[str, Any],
     norm_x_mu: Optional[torch.Tensor],
@@ -796,7 +789,7 @@ def run_rollout(
             )
 
         with torch.no_grad():
-            y_pred_norm, _score, _h = model(x_model, ei_dev)
+            y_pred_norm, _score, _h = _forward_model(model, x_model, ei_dev, pos_dev)
             y_pred_abs = _maybe_denorm(y_pred_norm, norm_y_mu, norm_y_std).detach().cpu()
 
         # Update autoregressive state only when prediction matches x channels.
@@ -1082,7 +1075,7 @@ def main() -> None:
     )
     ap.add_argument("--force-teacher", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--z-slice", type=int, default=None, help="When split_by_z=true, which z-slice group to use")
-    ap.add_argument("--max-points", type=int, default=30000, help="Max plotted points per frame (<=0 disables)")
+    ap.add_argument("--max-points", type=int, default=0, help="Max plotted points per frame (<=0 disables)")
     ap.add_argument("--point-size", type=float, default=2.0, help="Scatter marker size")
     ap.add_argument("--zoom-bbox", default=None, help="Optional zoom: xmin,xmax,ymin,ymax")
     ap.add_argument("--cmap-top", default="viridis", help="Colormap for state panels")

@@ -93,10 +93,17 @@
   },
 
   "model": {
-    "name": "FeatureNet",
+    "type": "sageconv",
+    "_comment_type": "Options: 'sageconv', 'meshgraphnet'",
     "hidden": 128,
     "layers": 3,
-    "dropout": 0.1
+    "dropout": 0.0,
+    "activation": "relu",
+    "activation_negative_slope": 0.01,
+    "activation_elu_alpha": 1.0,
+    "use_skip": false,
+    "use_layernorm": false,
+    "layernorm_eps": 1e-06
   },
 
   "loss": {

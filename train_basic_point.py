@@ -52,7 +52,7 @@ from torch import optim
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from torch_geometric.data import Data
 
-from models import FeatureNet
+from models import FeatureNet, MeshGraphNet
 import utils.dec_ops as dec
 import utils.mls as mls
 
@@ -2657,21 +2657,87 @@ def _build_physics_extra_features(
     return out
 
 
-def _build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int, device: torch.device) -> FeatureNet:
+def _model_type_from_cfg(cfg: Dict[str, Any]) -> str:
     mcfg = cfg.get("model", {}) or {}
-    model = FeatureNet(
-        in_channels=in_dim,
-        out_channels=out_dim,
-        hidden=int(mcfg.get("hidden", 128)),
-        layers=int(mcfg.get("layers", 3)),
-        dropout=float(mcfg.get("dropout", 0.1)),
-        make_score_head=False,
-    ).to(device)
-    return model
+    raw = mcfg.get("type", mcfg.get("name", "sageconv"))
+    key = str(raw).strip().lower().replace("-", "_")
+    sage_names = {"featurenet", "feature_net", "graphsage", "graph_sage", "sage", "sageconv"}
+    mesh_names = {"meshgraphnet", "mesh_graph_net", "mgn"}
+    flux_names = {"fluxgraphnet", "fluxgnn", "flux"}
+    if key in sage_names:
+        return "sageconv"
+    if key in mesh_names:
+        return "meshgraphnet"
+    if key in flux_names:
+        raise ValueError(
+            "model.type='fluxgraphnet' is used in the 1D projects, but the Karman point-graph "
+            "trainer currently supports only 'sageconv' and 'meshgraphnet'."
+        )
+    raise ValueError(
+        "Unsupported model.type/model.name. Use 'sageconv' or 'meshgraphnet'. "
+        f"Got {raw!r}."
+    )
+
+
+def _model_name_from_cfg(cfg: Dict[str, Any]) -> str:
+    """Back-compat wrapper for older scripts that asked for the model name."""
+    return _model_type_from_cfg(cfg)
+
+
+def _build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int, device: torch.device) -> torch.nn.Module:
+    mcfg = cfg.get("model", {}) or {}
+    model_type = _model_type_from_cfg(cfg)
+    if model_type == "sageconv":
+        return FeatureNet(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            hidden=int(mcfg.get("hidden", 128)),
+            layers=int(mcfg.get("layers", 3)),
+            dropout=float(mcfg.get("dropout", 0.0)),
+            make_score_head=False,
+        ).to(device)
+
+    if model_type == "meshgraphnet":
+        edge_pos_dim = int(mcfg.get("edge_pos_dim", 2))
+        edge_attr_channels = mcfg.get("edge_attr_channels", mcfg.get("edge_in_channels", None))
+        if edge_attr_channels is None:
+            edge_attr_channels = edge_pos_dim + 1
+        return MeshGraphNet(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            hidden=int(mcfg.get("hidden", 128)),
+            layers=int(mcfg.get("layers", mcfg.get("processor_steps", 3))),
+            edge_attr_channels=int(edge_attr_channels),
+            edge_pos_dim=edge_pos_dim,
+            mlp_hidden_layers=int(mcfg.get("mlp_hidden_layers", 1)),
+            activation=str(mcfg.get("activation", "relu")),
+            activation_negative_slope=float(mcfg.get("activation_negative_slope", 0.01)),
+            activation_elu_alpha=float(mcfg.get("activation_elu_alpha", 1.0)),
+            use_layernorm=bool(mcfg.get("use_layernorm", mcfg.get("layer_norm", False))),
+            layernorm_eps=float(mcfg.get("layernorm_eps", 1e-6)),
+            decoder_layer_norm=bool(mcfg.get("decoder_layer_norm", False)),
+            dropout=float(mcfg.get("dropout", 0.0)),
+            aggregation=str(mcfg.get("aggregation", "sum")),
+            use_skip=bool(mcfg.get("use_skip", False)),
+            make_score_head=False,
+        ).to(device)
+
+    raise RuntimeError(f"Unexpected normalized model type: {model_type!r}")
+
+
+def _forward_model(
+    model: torch.nn.Module,
+    x_model: torch.Tensor,
+    edge_index: torch.Tensor,
+    pos: torch.Tensor,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    if bool(getattr(model, "uses_edge_geometry", False)):
+        return model(x_model, edge_index, pos=pos)
+    return model(x_model, edge_index)
 
 
 def _run_epoch(
-    model: FeatureNet,
+    model: torch.nn.Module,
     loader: DataLoader,
     optimizer: Optional[optim.Optimizer],
     *,
@@ -2754,7 +2820,7 @@ def _run_epoch(
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
-        y_pred_norm, _score, _h = model(x_model, ei)
+        y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos)
         if use_huber:
             loss = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
         else:
@@ -2780,7 +2846,7 @@ def _run_epoch(
 
 
 def _run_epoch_multi_step(
-    model: FeatureNet,
+    model: torch.nn.Module,
     loader: DataLoader,
     optimizer: Optional[optim.Optimizer],
     *,
@@ -2918,7 +2984,7 @@ def _run_epoch_multi_step(
             x_model = torch.cat(x_parts, dim=1)
 
             with torch.set_grad_enabled(train_mode):
-                y_pred_norm, _score, _h = model(x_model, ei)
+                y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos)
                 if use_huber:
                     loss_k = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
                 else:
@@ -3558,9 +3624,36 @@ def main(config_path: str) -> None:
                 "autoregressive": bool(multi_step_autoreg),
             },
             "model": {
+                "type": _model_type_from_cfg(cfg),
                 "hidden": int((cfg.get("model", {}) or {}).get("hidden", 128)),
                 "layers": int((cfg.get("model", {}) or {}).get("layers", 3)),
-                "dropout": float((cfg.get("model", {}) or {}).get("dropout", 0.1)),
+                "edge_attr_channels": int(
+                    (cfg.get("model", {}) or {}).get(
+                        "edge_attr_channels",
+                        (cfg.get("model", {}) or {}).get(
+                            "edge_in_channels",
+                            int((cfg.get("model", {}) or {}).get("edge_pos_dim", 2)) + 1,
+                        ),
+                    )
+                ),
+                "edge_pos_dim": int((cfg.get("model", {}) or {}).get("edge_pos_dim", 2)),
+                "mlp_hidden_layers": int((cfg.get("model", {}) or {}).get("mlp_hidden_layers", 1)),
+                "activation": str((cfg.get("model", {}) or {}).get("activation", "relu")),
+                "activation_negative_slope": float(
+                    (cfg.get("model", {}) or {}).get("activation_negative_slope", 0.01)
+                ),
+                "activation_elu_alpha": float(
+                    (cfg.get("model", {}) or {}).get("activation_elu_alpha", 1.0)
+                ),
+                "use_skip": bool((cfg.get("model", {}) or {}).get("use_skip", False)),
+                "use_layernorm": bool(
+                    (cfg.get("model", {}) or {}).get(
+                        "use_layernorm",
+                        (cfg.get("model", {}) or {}).get("layer_norm", False),
+                    )
+                ),
+                "layernorm_eps": float((cfg.get("model", {}) or {}).get("layernorm_eps", 1e-6)),
+                "dropout": float((cfg.get("model", {}) or {}).get("dropout", 0.0)),
             },
             "derived": {
                 "dataset_mode": "window" if use_window_mode else "pair",
