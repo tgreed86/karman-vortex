@@ -4,7 +4,31 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv
 import inspect
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
+
+
+PREDICT_TYPE_STATE = "state"
+PREDICT_TYPE_DELTA = "delta"
+PREDICT_TYPE_RATE = "rate"
+PREDICT_TYPES = {PREDICT_TYPE_STATE, PREDICT_TYPE_DELTA, PREDICT_TYPE_RATE}
+
+
+def _normalize_predict_type(predict_type: Optional[str], default: str = PREDICT_TYPE_STATE) -> str:
+    key = str(default if predict_type is None else predict_type).strip().lower().replace("-", "_")
+    aliases = {
+        "absolute": PREDICT_TYPE_STATE,
+        "next": PREDICT_TYPE_STATE,
+        "next_state": PREDICT_TYPE_STATE,
+        "state": PREDICT_TYPE_STATE,
+        "delta": PREDICT_TYPE_DELTA,
+        "residual": PREDICT_TYPE_DELTA,
+        "rate": PREDICT_TYPE_RATE,
+        "derivative": PREDICT_TYPE_RATE,
+    }
+    key = aliases.get(key, key)
+    if key not in PREDICT_TYPES:
+        raise ValueError(f"predict_type must be one of {sorted(PREDICT_TYPES)}, got {predict_type!r}.")
+    return key
 
 
 class FeatureNet(nn.Module):
@@ -375,6 +399,666 @@ class MeshGraphNet(nn.Module):
         y_score = self.score_head(node_h) if self.score_head is not None else None
         return y_feat, y_score, node_h
 
+
+class FluxGraphNet(nn.Module):
+    """
+    FluxGraphNet-style model for Karman point-graph velocity prediction.
+
+    The processor is MeshGraphNet-like, but the decoder predicts one flux per
+    unique undirected graph edge. That flux is applied with opposite signs to
+    the two edge endpoints, so interior/cylinder nodes receive conservative
+    pairwise updates. Exterior domain-boundary nodes can additionally receive
+    non-conservative open-boundary source terms.
+    """
+
+    uses_edge_geometry = True
+    uses_dual_volume = True
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = 2,
+        hidden: int = 128,
+        layers: Optional[int] = None,
+        processor_steps: Optional[int] = None,
+        state_channel: int = 0,
+        predict_type: Optional[str] = None,
+        edge_attr_channels: Optional[int] = None,
+        edge_in_channels: Optional[int] = None,
+        edge_pos_dim: int = 2,
+        mlp_hidden_layers: int = 1,
+        activation: str = "relu",
+        activation_negative_slope: float = 0.01,
+        activation_elu_alpha: float = 1.0,
+        use_layernorm: bool = False,
+        layernorm_eps: float = 1e-6,
+        layer_norm: Optional[bool] = None,
+        dropout: float = 0.0,
+        aggregation: str = "sum",
+        flux_scale: float = 1.0,
+        use_dual_volume: bool = True,
+        volume_floor: float = 1e-12,
+        use_open_boundary_source: bool = True,
+        open_boundary_mode: str = "learned_source",
+        open_boundary_modes_by_side: Optional[Dict[str, str]] = None,
+        open_boundary_source_channels: Optional[Sequence[int]] = None,
+        open_boundary_flux_sides: Optional[Sequence[str] | str] = None,
+        open_boundary_flux_scale: float = 0.05,
+        open_boundary_flux_outflow_only: bool = True,
+        boundary_width: float = 0.02,
+        domain_bbox: Optional[Sequence[float] | str] = None,
+        cylinder_center_xy: Optional[Sequence[float]] = None,
+        cylinder_radius: float = 0.5,
+        cylinder_boundary_width: float = 0.08,
+        velocity_channels: Optional[Sequence[int]] = None,
+        make_score_head: bool = False,
+    ):
+        super().__init__()
+        if int(in_channels) <= 0:
+            raise ValueError(f"in_channels must be > 0, got {in_channels}.")
+        if int(out_channels) <= 0:
+            raise ValueError(f"out_channels must be > 0, got {out_channels}.")
+        if int(state_channel) < 0 or int(state_channel) + int(out_channels) > int(in_channels):
+            raise ValueError(
+                "state_channel/out_channels must select a valid state slice from the model input; "
+                f"got state_channel={state_channel}, out_channels={out_channels}, in_channels={in_channels}."
+            )
+        hidden = int(hidden)
+        if hidden <= 0:
+            raise ValueError(f"hidden must be > 0, got {hidden}.")
+        if layers is None:
+            layers = processor_steps if processor_steps is not None else 3
+        layers = max(1, int(layers))
+        edge_pos_dim = max(1, int(edge_pos_dim))
+        if edge_attr_channels is None:
+            edge_attr_channels = edge_in_channels
+        if edge_attr_channels is None:
+            edge_attr_channels = (2 * edge_pos_dim) + 1
+        if int(edge_attr_channels) <= 0:
+            raise ValueError(f"edge_attr_channels must be > 0, got {edge_attr_channels}.")
+        if layer_norm is not None:
+            use_layernorm = bool(layer_norm)
+        agg = str(aggregation).strip().lower()
+        if agg != "sum":
+            raise ValueError("FluxGraphNet aggregation must be 'sum' so edge fluxes remain additive.")
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.hidden = hidden
+        self.layers = layers
+        self.state_channel = int(state_channel)
+        self.predict_type = _normalize_predict_type(predict_type, default=PREDICT_TYPE_STATE)
+        self.edge_pos_dim = edge_pos_dim
+        self.edge_attr_channels = int(edge_attr_channels)
+        self.edge_in_channels = int(edge_attr_channels)
+        self.dropout = float(dropout)
+        self.flux_scale = float(flux_scale)
+        self.use_dual_volume = bool(use_dual_volume)
+        self.volume_floor = float(volume_floor)
+        self.use_open_boundary_source = bool(use_open_boundary_source)
+        self.open_boundary_mode = self._normalize_open_boundary_mode(open_boundary_mode)
+        self.open_boundary_flux_scale = float(open_boundary_flux_scale)
+        if self.open_boundary_flux_scale < 0.0:
+            raise ValueError("open_boundary_flux_scale must be >= 0.")
+        self.open_boundary_flux_outflow_only = bool(open_boundary_flux_outflow_only)
+        self.boundary_width = float(boundary_width)
+        self.cylinder_radius = float(cylinder_radius)
+        self.cylinder_boundary_width = float(cylinder_boundary_width)
+
+        if domain_bbox is None or str(domain_bbox).strip().lower() == "auto":
+            self.domain_bbox = None
+        else:
+            if not isinstance(domain_bbox, (list, tuple)) or len(domain_bbox) != 4:
+                raise ValueError("FluxGraphNet domain_bbox must be null/'auto' or [xmin, xmax, ymin, ymax].")
+            self.domain_bbox = tuple(float(v) for v in domain_bbox)
+
+        if cylinder_center_xy is None:
+            cylinder_center_xy = (0.0, 0.0)
+        if len(cylinder_center_xy) != 2:
+            raise ValueError("cylinder_center_xy must contain two values [cx, cy].")
+        self.register_buffer(
+            "cylinder_center_xy",
+            torch.tensor([float(cylinder_center_xy[0]), float(cylinder_center_xy[1])], dtype=torch.float32),
+            persistent=False,
+        )
+
+        learned_side_mask, flux_mode_side_mask = self._make_open_boundary_mode_side_masks(
+            self.open_boundary_mode,
+            open_boundary_modes_by_side,
+        )
+        self.register_buffer("open_boundary_learned_side_mask", learned_side_mask, persistent=False)
+        self.register_buffer("open_boundary_flux_mode_side_mask", flux_mode_side_mask, persistent=False)
+        self.register_buffer(
+            "open_boundary_flux_side_mask",
+            self._make_boundary_side_mask(open_boundary_flux_sides),
+            persistent=False,
+        )
+        self.register_buffer(
+            "open_boundary_source_mask",
+            self._make_state_channel_mask(open_boundary_source_channels, self.out_channels),
+            persistent=False,
+        )
+
+        if velocity_channels is None:
+            velocity_channels = (0, 1) if self.out_channels >= 2 else (0, 0)
+        if len(velocity_channels) < 2:
+            raise ValueError("velocity_channels must provide two state-relative channel indices.")
+        vel0 = int(velocity_channels[0])
+        vel1 = int(velocity_channels[1])
+        if vel0 < 0 or vel0 >= self.out_channels or vel1 < 0 or vel1 >= self.out_channels:
+            raise ValueError(
+                f"velocity_channels must index the {self.out_channels} predicted channels, got {velocity_channels}."
+            )
+        self.velocity_channels = (vel0, vel1)
+
+        self.block_activation = _make_activation(
+            activation,
+            negative_slope=float(activation_negative_slope),
+            elu_alpha=float(activation_elu_alpha),
+        )
+        self.node_encoder = MeshGraphMLP(
+            self.in_channels,
+            hidden,
+            hidden_dim=hidden,
+            hidden_layers=mlp_hidden_layers,
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            dropout=dropout,
+        )
+        self.edge_encoder = MeshGraphMLP(
+            self.edge_in_channels,
+            hidden,
+            hidden_dim=hidden,
+            hidden_layers=mlp_hidden_layers,
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            dropout=dropout,
+        )
+        self.processor = nn.ModuleList(
+            [
+                MeshGraphNetBlock(
+                    hidden,
+                    mlp_hidden_layers=mlp_hidden_layers,
+                    activation=activation,
+                    activation_negative_slope=activation_negative_slope,
+                    activation_elu_alpha=activation_elu_alpha,
+                    use_layernorm=bool(use_layernorm),
+                    layernorm_eps=float(layernorm_eps),
+                    dropout=dropout,
+                    aggregation=aggregation,
+                )
+                for _ in range(layers)
+            ]
+        )
+        self.flux_head = MeshGraphMLP(
+            (2 * hidden) + self.edge_in_channels,
+            self.out_channels,
+            hidden_dim=hidden,
+            hidden_layers=mlp_hidden_layers,
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            dropout=dropout,
+        )
+        self.open_boundary_head = (
+            MeshGraphMLP(
+                hidden,
+                self.out_channels,
+                hidden_dim=hidden,
+                hidden_layers=mlp_hidden_layers,
+                activation=activation,
+                activation_negative_slope=activation_negative_slope,
+                activation_elu_alpha=activation_elu_alpha,
+                dropout=dropout,
+            )
+            if (
+                self.use_open_boundary_source
+                and bool(torch.any(self.open_boundary_learned_side_mask > 0).item())
+            )
+            else None
+        )
+        self.score_head = None
+        if bool(make_score_head):
+            self.score_head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, 1),
+            )
+
+    @staticmethod
+    def _normalize_open_boundary_mode(mode: Optional[str]) -> str:
+        key = str("learned_source" if mode is None else mode).strip().lower().replace("-", "_")
+        aliases = {
+            "learned": "learned_source",
+            "source": "learned_source",
+            "learned_source": "learned_source",
+            "boundary_source": "learned_source",
+            "mlp": "learned_source",
+            "flux": "boundary_flux",
+            "boundary_flux": "boundary_flux",
+            "outflow": "boundary_flux",
+            "outflow_flux": "boundary_flux",
+            "open_flux": "boundary_flux",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+            "false": "none",
+        }
+        if key not in aliases:
+            raise ValueError(
+                "open_boundary_mode must be one of {learned_source, boundary_flux, none}; "
+                f"got {mode!r}."
+            )
+        return aliases[key]
+
+    @staticmethod
+    def _boundary_side_index(side: str) -> int:
+        aliases = {
+            "left": 0,
+            "l": 0,
+            "xmin": 0,
+            "x_min": 0,
+            "right": 1,
+            "r": 1,
+            "xmax": 1,
+            "x_max": 1,
+            "bottom": 2,
+            "b": 2,
+            "ymin": 2,
+            "y_min": 2,
+            "top": 3,
+            "t": 3,
+            "ymax": 3,
+            "y_max": 3,
+        }
+        key = str(side).strip().lower().replace("-", "_")
+        if key not in aliases:
+            raise ValueError(
+                "Boundary side entries must be drawn from {left, right, bottom, top}; "
+                f"got {side!r}."
+            )
+        return aliases[key]
+
+    @classmethod
+    def _make_open_boundary_mode_side_masks(
+        cls,
+        global_mode: str,
+        modes_by_side: Optional[Dict[str, str]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        side_modes = [cls._normalize_open_boundary_mode(global_mode)] * 4
+        if modes_by_side is not None:
+            if not isinstance(modes_by_side, dict):
+                raise ValueError(
+                    "open_boundary_modes_by_side must map {left,right,bottom,top} "
+                    "to {learned_source,boundary_flux,none}."
+                )
+            for side, mode in modes_by_side.items():
+                mode_key = cls._normalize_open_boundary_mode(mode)
+                side_key = str(side).strip().lower().replace("-", "_")
+                if side_key in {"all", "*"}:
+                    side_modes = [mode_key] * 4
+                else:
+                    side_modes[cls._boundary_side_index(side_key)] = mode_key
+
+        learned = torch.zeros(4, dtype=torch.float32)
+        flux = torch.zeros(4, dtype=torch.float32)
+        for i, mode in enumerate(side_modes):
+            if mode == "learned_source":
+                learned[i] = 1.0
+            elif mode == "boundary_flux":
+                flux[i] = 1.0
+        return learned, flux
+
+    @classmethod
+    def _make_boundary_side_mask(cls, sides: Optional[Sequence[str] | str]) -> torch.Tensor:
+        mask = torch.ones(4, dtype=torch.float32)
+        if sides is None:
+            return mask
+        if isinstance(sides, str):
+            items = [s.strip() for s in sides.replace(";", ",").split(",") if s.strip()]
+        else:
+            items = [str(s).strip() for s in sides]
+        if not items or any(str(s).strip().lower() in {"all", "*"} for s in items):
+            return mask
+        mask.zero_()
+        for side in items:
+            mask[cls._boundary_side_index(side)] = 1.0
+        return mask
+
+    @staticmethod
+    def _make_state_channel_mask(channels: Optional[Sequence[int]], out_channels: int) -> torch.Tensor:
+        mask = torch.ones(int(out_channels), dtype=torch.float32)
+        if channels is None:
+            return mask
+        mask.zero_()
+        for ch in channels:
+            ci = int(ch)
+            if ci < 0 or ci >= int(out_channels):
+                raise ValueError(f"Boundary source channel index {ci} is outside [0,{int(out_channels) - 1}].")
+            mask[ci] = 1.0
+        return mask
+
+    def _edge_features_from_pairs(
+        self,
+        lo: torch.Tensor,
+        hi: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        p = pos[:, : self.edge_pos_dim].to(device=device, dtype=dtype)
+        rel = p[hi.long()] - p[lo.long()]
+        dist = torch.linalg.norm(rel, dim=1, keepdim=True).clamp_min(1e-12)
+        unit = rel / dist
+        edge_feat = torch.cat([rel, dist, unit], dim=-1)
+        if edge_feat.size(1) < self.edge_in_channels:
+            pad = torch.zeros(
+                (edge_feat.size(0), self.edge_in_channels - edge_feat.size(1)),
+                device=device,
+                dtype=dtype,
+            )
+            edge_feat = torch.cat([edge_feat, pad], dim=-1)
+        elif edge_feat.size(1) > self.edge_in_channels:
+            edge_feat = edge_feat[:, : self.edge_in_channels]
+        return edge_feat
+
+    def _build_edge_features(
+        self,
+        edge_index: torch.Tensor,
+        pos: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if pos is None:
+            raise ValueError("FluxGraphNet.forward requires pos=... for unstructured edge-flux geometry.")
+        if pos.ndim != 2 or int(pos.size(1)) < self.edge_pos_dim:
+            raise ValueError(
+                f"FluxGraphNet expected pos shape [N,>={self.edge_pos_dim}], got {tuple(pos.shape)}"
+            )
+        return self._edge_features_from_pairs(edge_index[0], edge_index[1], pos, dtype=dtype, device=device)
+
+    def _unique_undirected_pairs(
+        self,
+        edge_index: torch.Tensor,
+        num_nodes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+        valid = (src >= 0) & (src < num_nodes) & (dst >= 0) & (dst < num_nodes) & (src != dst)
+        if not bool(valid.any()):
+            empty = src.new_empty((0,))
+            return empty, empty
+        src = src[valid]
+        dst = dst[valid]
+        lo_all = torch.minimum(src, dst)
+        hi_all = torch.maximum(src, dst)
+        pair_key = lo_all * int(num_nodes) + hi_all
+        unique_key = torch.unique(pair_key, sorted=True)
+        lo = torch.div(unique_key, int(num_nodes), rounding_mode="floor")
+        hi = unique_key - (lo * int(num_nodes))
+        return lo.long(), hi.long()
+
+    def _volume_factor(
+        self,
+        dual_volume: Optional[torch.Tensor],
+        *,
+        num_nodes: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_dual_volume or dual_volume is None:
+            return None
+        vol = dual_volume.to(device=device, dtype=dtype)
+        if vol.ndim == 2:
+            vol = vol[:, 0]
+        elif vol.ndim != 1:
+            raise ValueError(f"dual_volume must be [N] or [N,1], got shape={tuple(vol.shape)}.")
+        if int(vol.numel()) != int(num_nodes):
+            raise ValueError(f"dual_volume node count mismatch: got {int(vol.numel())}, expected {num_nodes}.")
+        return vol.clamp_min(self.volume_floor).view(-1, 1)
+
+    def _compute_flux_update(
+        self,
+        *,
+        node_latent: torch.Tensor,
+        edge_index: torch.Tensor,
+        pos: torch.Tensor,
+        dual_volume: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        num_nodes = int(node_latent.size(0))
+        lo, hi = self._unique_undirected_pairs(edge_index, num_nodes)
+        update = torch.zeros((num_nodes, self.out_channels), device=node_latent.device, dtype=node_latent.dtype)
+        if lo.numel() == 0:
+            return update
+
+        h_lo = node_latent[lo]
+        h_hi = node_latent[hi]
+        pair_mean = 0.5 * (h_lo + h_hi)
+        pair_absdiff = torch.abs(h_hi - h_lo)
+        edge_feat = self._edge_features_from_pairs(
+            lo,
+            hi,
+            pos,
+            dtype=node_latent.dtype,
+            device=node_latent.device,
+        )
+        flux_in = torch.cat([pair_mean, pair_absdiff, edge_feat], dim=-1)
+        flux = self.flux_head(flux_in) * self.flux_scale
+        update.index_add_(0, lo, -flux)
+        update.index_add_(0, hi, flux)
+
+        vol = self._volume_factor(
+            dual_volume,
+            num_nodes=num_nodes,
+            device=node_latent.device,
+            dtype=node_latent.dtype,
+        )
+        if vol is not None:
+            update = update / vol
+        return update
+
+    def _domain_bbox_for_pos(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pxy = pos[:, :2]
+        if self.domain_bbox is None:
+            xmin = pxy[:, 0].min()
+            xmax = pxy[:, 0].max()
+            ymin = pxy[:, 1].min()
+            ymax = pxy[:, 1].max()
+        else:
+            xmin, xmax, ymin, ymax = [pxy.new_tensor(v) for v in self.domain_bbox]
+        return xmin, xmax, ymin, ymax
+
+    def _linear_gate_from_distance(self, dist: torch.Tensor, width: float) -> torch.Tensor:
+        width_t = max(float(width), 1e-12)
+        return (1.0 - (dist / width_t)).clamp(min=0.0, max=1.0)
+
+    def _boundary_side_gates_and_cylinder(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pxy = pos[:, :2]
+        xmin, xmax, ymin, ymax = self._domain_bbox_for_pos(pxy)
+        x = pxy[:, 0]
+        y = pxy[:, 1]
+        x_span = (xmax - xmin).abs().clamp_min(1e-12)
+        y_span = (ymax - ymin).abs().clamp_min(1e-12)
+        side_dist = torch.stack(
+            [
+                (x - xmin).clamp_min(0.0) / x_span,
+                (xmax - x).clamp_min(0.0) / x_span,
+                (y - ymin).clamp_min(0.0) / y_span,
+                (ymax - y).clamp_min(0.0) / y_span,
+            ],
+            dim=1,
+        )
+        side_gates = self._linear_gate_from_distance(side_dist, self.boundary_width)
+
+        cxy = self.cylinder_center_xy.to(device=pos.device, dtype=pos.dtype).view(1, 2)
+        radial = torch.linalg.norm(pxy - cxy, dim=1, keepdim=True)
+        cylinder_dist = (radial - float(self.cylinder_radius)).abs()
+        cylinder_gate = self._linear_gate_from_distance(
+            cylinder_dist,
+            max(float(self.cylinder_boundary_width), 1e-12),
+        )
+        return side_gates, cylinder_gate
+
+    def _open_boundary_flux_source(
+        self,
+        *,
+        state: torch.Tensor,
+        side_gates: torch.Tensor,
+        cylinder_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        source = torch.zeros_like(state)
+        if (
+            not self.use_open_boundary_source
+            or self.open_boundary_flux_scale <= 0.0
+            or side_gates.numel() == 0
+        ):
+            return source
+
+        side_mask = self.open_boundary_flux_side_mask.to(device=state.device, dtype=state.dtype).view(1, 4)
+        mode_mask = self.open_boundary_flux_mode_side_mask.to(device=state.device, dtype=state.dtype).view(1, 4)
+        gates = (side_gates.to(dtype=state.dtype) * side_mask * mode_mask * (1.0 - cylinder_gate)).clamp(0.0, 1.0)
+        if not bool(torch.any(gates > 0).item()):
+            return source
+
+        u = state[:, self.velocity_channels[0]]
+        v = state[:, self.velocity_channels[1]]
+        normals = state.new_tensor(
+            [
+                [-1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, -1.0],
+                [0.0, 1.0],
+            ]
+        )
+        channel_mask = self.open_boundary_source_mask.to(device=state.device, dtype=state.dtype).view(1, -1)
+        for side in range(4):
+            gate = gates[:, side : side + 1]
+            if not bool(torch.any(gate > 0).item()):
+                continue
+            un = (u * normals[side, 0]) + (v * normals[side, 1])
+            speed = un.clamp_min(0.0) if self.open_boundary_flux_outflow_only else un
+            source = source - float(self.open_boundary_flux_scale) * gate * speed.view(-1, 1) * state * channel_mask
+        return source
+
+    def _boundary_source(
+        self,
+        *,
+        state: torch.Tensor,
+        node_latent: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> torch.Tensor:
+        source = torch.zeros_like(state)
+        if not self.use_open_boundary_source:
+            return source
+        side_gates, cylinder_gate = self._boundary_side_gates_and_cylinder(pos)
+        side_gates = side_gates.to(device=state.device, dtype=state.dtype)
+        cylinder_gate = cylinder_gate.to(device=state.device, dtype=state.dtype)
+
+        learned_mask = self.open_boundary_learned_side_mask.to(device=state.device, dtype=state.dtype).view(1, 4)
+        learned_side_gates = (side_gates * learned_mask * (1.0 - cylinder_gate)).clamp(0.0, 1.0)
+        learned_gate = learned_side_gates.max(dim=1, keepdim=True).values
+        if self.open_boundary_head is not None and bool(torch.any(learned_gate > 0).item()):
+            channel_mask = self.open_boundary_source_mask.to(device=state.device, dtype=state.dtype).view(1, -1)
+            source = source + learned_gate * self.open_boundary_head(node_latent) * channel_mask
+
+        source = source + self._open_boundary_flux_source(
+            state=state,
+            side_gates=side_gates,
+            cylinder_gate=cylinder_gate,
+        )
+        return source
+
+    def _state_slice(self, x: torch.Tensor) -> torch.Tensor:
+        return x[:, self.state_channel : self.state_channel + self.out_channels]
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        edge_index: torch.Tensor,
+        pos: Optional[torch.Tensor] = None,
+        dual_volume: Optional[torch.Tensor] = None,
+        dt: Optional[float] = None,
+    ):
+        del dt
+        if pos is None:
+            raise ValueError("FluxGraphNet.forward requires pos=... for graph-edge flux geometry.")
+        edge_index = edge_index.to(device=X.device, dtype=torch.long)
+        pos = pos.to(device=X.device, dtype=X.dtype)
+        edge_feat = self._build_edge_features(
+            edge_index,
+            pos,
+            dtype=X.dtype,
+            device=X.device,
+        )
+
+        node_h = self.node_encoder(X)
+        edge_h = self.edge_encoder(edge_feat)
+        for block in self.processor:
+            node_h, edge_h = block(node_h, edge_h, edge_index)
+            node_h = self.block_activation(node_h)
+            node_h = F.dropout(node_h, p=self.dropout, training=self.training)
+
+        state = self._state_slice(X)
+        update = self._compute_flux_update(
+            node_latent=node_h,
+            edge_index=edge_index,
+            pos=pos,
+            dual_volume=dual_volume,
+        )
+        update = update + self._boundary_source(state=state, node_latent=node_h, pos=pos)
+
+        if self.predict_type == PREDICT_TYPE_STATE:
+            y_feat = state + update
+        elif self.predict_type in {PREDICT_TYPE_DELTA, PREDICT_TYPE_RATE}:
+            y_feat = update
+        else:
+            raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+        y_score = self.score_head(node_h) if self.score_head is not None else None
+        return y_feat, y_score, node_h
+
+    def predict_state(
+        self,
+        X: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        pos: Optional[torch.Tensor] = None,
+        dual_volume: Optional[torch.Tensor] = None,
+        dt: float = 1.0,
+        state_override: Optional[torch.Tensor] = None,
+        state_residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if state_override is not None and state_residual is not None:
+            raise ValueError("Pass only one of state_override or state_residual.")
+        state_in = self._state_slice(X)
+        state_ref = state_override if state_override is not None else state_residual
+        if state_ref is None:
+            state_base = state_in
+        else:
+            if state_ref.ndim != 2 or state_ref.shape != state_in.shape:
+                raise ValueError(
+                    "state_override/state_residual must match the state slice shape "
+                    f"{tuple(state_in.shape)}, got {tuple(state_ref.shape)}."
+                )
+            state_base = state_ref.to(device=X.device, dtype=X.dtype)
+
+        y, _score, _h = self.forward(X, edge_index, pos=pos, dual_volume=dual_volume, dt=dt)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            if state_ref is None:
+                return y
+            return y + (state_base - state_in)
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return state_base + y
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return state_base + float(dt) * y
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+
 class FeatureExtractorGNN(nn.Module):
     """
     GraphUNet-based feature extractor for each node with attention.
@@ -666,6 +1350,10 @@ def build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int):
         "meshgraphnet": "MeshGraphNet",
         "mesh_graph_net": "MeshGraphNet",
         "mgn": "MeshGraphNet",
+        "fluxgraphnet": "FluxGraphNet",
+        "flux_graph_net": "FluxGraphNet",
+        "fluxgnn": "FluxGraphNet",
+        "flux": "FluxGraphNet",
     }
     selector_key = str(selector).strip().lower().replace("-", "_")
     class_name = aliases.get(selector_key, str(selector).strip())

@@ -94,7 +94,7 @@
 
   "model": {
     "type": "sageconv",
-    "_comment_type": "Options: 'sageconv', 'meshgraphnet'",
+    "_comment_type": "Options: 'sageconv', 'meshgraphnet', 'fluxgraphnet'",
     "hidden": 128,
     "layers": 3,
     "dropout": 0.0,
@@ -103,7 +103,29 @@
     "activation_elu_alpha": 1.0,
     "use_skip": false,
     "use_layernorm": false,
-    "layernorm_eps": 1e-06
+    "layernorm_eps": 1e-06,
+
+    "_comment_fluxgraphnet": "Used when model.type='fluxgraphnet'. Edge fluxes are conservative on interior/cylinder graph edges; exterior domain sides use open-boundary source terms.",
+    "predict_type": "state",
+    "flux_scale": 1.0,
+    "use_dual_volume": true,
+    "volume_floor": 1e-12,
+    "use_open_boundary_source": true,
+    "open_boundary_mode": "learned_source",
+    "open_boundary_modes_by_side": {
+      "left": "learned_source",
+      "right": "learned_source",
+      "bottom": "learned_source",
+      "top": "learned_source"
+    },
+    "open_boundary_flux_scale": 0.05,
+    "open_boundary_flux_outflow_only": true,
+    "boundary_width": 0.02,
+    "domain_bbox": [-5.0, 15.0, -5.0, 5.0],
+    "cylinder_center_xy": [0.0, 0.0],
+    "cylinder_radius": 0.5,
+    "cylinder_boundary_width": 0.08,
+    "velocity_channels": [0, 1]
   },
 
   "loss": {

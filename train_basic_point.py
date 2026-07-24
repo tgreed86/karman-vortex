@@ -52,7 +52,7 @@ from torch import optim
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from torch_geometric.data import Data
 
-from models import FeatureNet, MeshGraphNet
+from models import FeatureNet, FluxGraphNet, MeshGraphNet
 import utils.dec_ops as dec
 import utils.mls as mls
 
@@ -103,6 +103,17 @@ def _as_2d_float(x: Any, name: str) -> torch.Tensor:
     if t.ndim != 2:
         raise ValueError(f"{name} must be 2D, got {tuple(t.shape)}")
     return t
+
+
+def _as_optional_node_scalar(x: Any, name: str, n_nodes: int) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    t = _as_2d_float(x, name)
+    if t.size(0) != n_nodes and t.size(0) == 1 and t.size(1) == n_nodes:
+        t = t.t().contiguous()
+    if t.size(0) != n_nodes:
+        raise ValueError(f"{name} must have one row per node ({n_nodes}), got shape {tuple(t.shape)}")
+    return t[:, :1].contiguous()
 
 
 def _extract_time(step_obj: Any) -> Optional[float]:
@@ -1193,6 +1204,14 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
     pos = _as_2d_float(pos_raw, "pos")
     edge_index = _as_edge_index(edge_raw)
     n_nodes = int(pos.size(0))
+    dual_volume_key = None
+    dual_volume = None
+    for vk in ("dual_volume", "dual_volumes", "control_volume", "control_volumes", "cell_area", "cell_areas", "node_area", "node_areas"):
+        vv = obj.get(vk, None)
+        if vv is not None:
+            dual_volume_key = vk
+            dual_volume = _as_optional_node_scalar(vv, vk, n_nodes)
+            break
 
     x_tnf = _coerce_time_series_to_tnf(torch.as_tensor(x_raw, dtype=torch.float32), n_nodes, x_key)
     T = int(x_tnf.size(0))
@@ -1235,6 +1254,7 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
         "time_start": obj.get("time_start", None),
         "time_end": obj.get("time_end", None),
         "source_x_key": x_key,
+        "dual_volume_key": dual_volume_key,
     }
 
     print(
@@ -1250,6 +1270,7 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
                 "y": (None if y_tnf is None else y_tnf[i]),
                 "pos": pos,
                 "edge_index": edge_index,
+                "dual_volume": dual_volume,
                 "time": float(time_vec[i].item()),
                 "global_params": gp_base,
             }
@@ -1291,6 +1312,14 @@ def _extract_step_fields(step: Any) -> Dict[str, Any]:
     y = _extract_attr(step, "y", None)
     pos = _extract_attr(step, "pos", _extract_attr(step, "xy", None))
     edge_index = _extract_attr(step, "edge_index", _extract_attr(step, "ei", None))
+    dual_volume_raw = None
+    dual_volume_name = None
+    for vk in ("dual_volume", "dual_volumes", "control_volume", "control_volumes", "cell_area", "cell_areas", "node_area", "node_areas"):
+        vv = _extract_attr(step, vk, None)
+        if vv is not None:
+            dual_volume_raw = vv
+            dual_volume_name = vk
+            break
     if x is None:
         x = _extract_attr(step, "features", None)
 
@@ -1304,11 +1333,17 @@ def _extract_step_fields(step: Any) -> Dict[str, Any]:
             missing.append("edge_index/ei")
         raise KeyError(f"Timestep is missing required fields: {', '.join(missing)}")
 
+    pos_t = _as_2d_float(pos, "pos")
     out = {
         "x": _as_2d_float(x, "x"),
         "y": None if y is None else _as_2d_float(y, "y"),
-        "pos": _as_2d_float(pos, "pos"),
+        "pos": pos_t,
         "edge_index": _as_edge_index(edge_index),
+        "dual_volume": (
+            None
+            if dual_volume_raw is None
+            else _as_optional_node_scalar(dual_volume_raw, str(dual_volume_name), int(pos_t.size(0)))
+        ),
         "time": _extract_time(step),
         "global_params": _extract_attr(step, "global_params", None),
     }
@@ -1341,7 +1376,8 @@ def _subgraph_by_index(
     pos: torch.Tensor,
     edge_index: torch.Tensor,
     keep_idx: torch.Tensor,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    dual_volume: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     keep_idx = keep_idx.to(torch.long)
     n = x.size(0)
     remap = torch.full((n,), -1, dtype=torch.long)
@@ -1365,6 +1401,7 @@ def _subgraph_by_index(
         None if y is None else y.index_select(0, keep_idx),
         pos.index_select(0, keep_idx),
         ei_sub,
+        None if dual_volume is None else dual_volume.index_select(0, keep_idx),
     )
 
 
@@ -1374,6 +1411,7 @@ class PointPair:
     y: torch.Tensor
     pos: torch.Tensor
     edge_index: torch.Tensor
+    dual_volume: Optional[torch.Tensor] = None
     t_src: Optional[float] = None
     t_dst: Optional[float] = None
     meta: Optional[Dict[str, Any]] = None
@@ -1433,6 +1471,7 @@ class PointGraphTemporalDataset(Dataset):
                 x0 = s0["x"]
                 pos0 = s0["pos"]
                 ei0 = s0["edge_index"]
+                dual_volume0 = s0.get("dual_volume", None)
 
                 # Target selection policy.
                 if use_y_target and (s0["y"] is not None):
@@ -1466,7 +1505,14 @@ class PointGraphTemporalDataset(Dataset):
                     z = pos0[:, z_index]
                     groups = _build_z_groups(z, z_tol=z_tol)
                     for gidx, keep in enumerate(groups):
-                        xs, ys, ps, eis = _subgraph_by_index(x_sel, y_sel, pos_sel, ei0, keep)
+                        xs, ys, ps, eis, dvs = _subgraph_by_index(
+                            x_sel,
+                            y_sel,
+                            pos_sel,
+                            ei0,
+                            keep,
+                            dual_volume=dual_volume0,
+                        )
                         if xs.size(0) == 0:
                             continue
                         pairs.append(
@@ -1475,6 +1521,7 @@ class PointGraphTemporalDataset(Dataset):
                                 y=ys,
                                 pos=ps,
                                 edge_index=eis,
+                                dual_volume=dvs,
                                 t_src=s0["time"],
                                 t_dst=s1["time"],
                                 meta={
@@ -1493,6 +1540,7 @@ class PointGraphTemporalDataset(Dataset):
                             y=y_sel,
                             pos=pos_sel,
                             edge_index=ei0,
+                            dual_volume=dual_volume0,
                             t_src=s0["time"],
                             t_dst=s1["time"],
                             meta={
@@ -1511,6 +1559,7 @@ class PointGraphTemporalDataset(Dataset):
         self.x_dim = int(self.pairs[0].x.size(1))
         self.y_dim = int(self.pairs[0].y.size(1))
         self.pos_dim = int(self.pairs[0].pos.size(1))
+        self.has_dual_volume = any(p.dual_volume is not None for p in self.pairs)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -1522,6 +1571,7 @@ class PointGraphTemporalDataset(Dataset):
             "y": p.y,
             "pos": p.pos,
             "edge_index": p.edge_index,
+            "dual_volume": p.dual_volume,
             "t_src": p.t_src,
             "t_dst": p.t_dst,
             "meta": p.meta,
@@ -1601,6 +1651,7 @@ class PointGraphWindowDataset(Dataset):
                 y_sel = None if s["y"] is None else _select_columns(s["y"], y_cols)
                 pos_sel = _select_columns(s["pos"], pos_cols)
                 ei = s["edge_index"]
+                dual_volume = s.get("dual_volume", None)
 
                 if split_by_z:
                     if z_index < 0 or z_index >= s["pos"].size(1):
@@ -1621,7 +1672,14 @@ class PointGraphWindowDataset(Dataset):
                             f"(source={src_path})."
                         )
                     for gidx, keep in enumerate(groups):
-                        xs, ys, ps, eis = _subgraph_by_index(x_sel, y_sel, pos_sel, ei, keep)
+                        xs, ys, ps, eis, dvs = _subgraph_by_index(
+                            x_sel,
+                            y_sel,
+                            pos_sel,
+                            ei,
+                            keep,
+                            dual_volume=dual_volume,
+                        )
                         if xs.size(0) == 0:
                             raise RuntimeError(f"Empty z-group at t={t}, group={gidx} (source={src_path}).")
                         if ys is not None and ys.size(0) != xs.size(0):
@@ -1635,6 +1693,7 @@ class PointGraphWindowDataset(Dataset):
                                 "y": ys,
                                 "pos": ps,
                                 "edge_index": eis,
+                                "dual_volume": dvs,
                                 "time": s["time"],
                                 "meta": {
                                     "t": t,
@@ -1659,6 +1718,7 @@ class PointGraphWindowDataset(Dataset):
                             "y": y_sel,
                             "pos": pos_sel,
                             "edge_index": ei,
+                            "dual_volume": dual_volume,
                             "time": s["time"],
                             "meta": {
                                 "t": t,
@@ -1693,6 +1753,11 @@ class PointGraphWindowDataset(Dataset):
         self.x_dim = int(ex0["x_list"][0].size(1))
         self.y_dim = int(ex0["y_list"][0].size(1))
         self.pos_dim = int(ex0["pos_list"][0].size(1))
+        self.has_dual_volume = any(
+            s.get("dual_volume", None) is not None
+            for seq in self.sequences
+            for s in seq
+        )
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -1705,6 +1770,7 @@ class PointGraphWindowDataset(Dataset):
         x_list = [s["x"] for s in chunk]
         pos_list = [s["pos"] for s in chunk]
         edge_index_list = [s["edge_index"] for s in chunk]
+        dual_volume_list = [s.get("dual_volume", None) for s in chunk]
         t_list = [s["time"] for s in chunk]
 
         y_list: List[torch.Tensor] = []
@@ -1727,6 +1793,7 @@ class PointGraphWindowDataset(Dataset):
             "y_list": y_list,
             "pos_list": pos_list,
             "edge_index_list": edge_index_list,
+            "dual_volume_list": dual_volume_list,
             "t_list": t_list,
             "meta": {
                 "seq_id": seq_id,
@@ -1740,6 +1807,7 @@ class PointGraphWindowDataset(Dataset):
             "y": y_list[0],
             "pos": pos_list[0],
             "edge_index": edge_index_list[0],
+            "dual_volume": dual_volume_list[0],
             "t_src": t_list[0],
             "t_dst": t_list[1] if len(t_list) > 1 else None,
         }
@@ -2334,6 +2402,7 @@ def _get_mls_ops(cfg: Dict[str, Any]):
 def _geometry_from_pos_edge(
     pos: torch.Tensor,
     edge_index: torch.Tensor,
+    dual_volume: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     # Do not cache geometry tensors here.
     #
@@ -2372,6 +2441,20 @@ def _geometry_from_pos_edge(
         fallback = torch.tensor(1.0, device=pos.device, dtype=torch.float32)
     area = torch.where(pos_area, area, fallback)
     area = area.clamp_min(1e-12)
+
+    if dual_volume is not None:
+        dv = dual_volume.to(device=pos.device, dtype=torch.float32)
+        if dv.ndim == 2:
+            dv = dv[:, 0]
+        elif dv.ndim != 1:
+            raise ValueError(f"dual_volume must be [N] or [N,1], got shape {tuple(dv.shape)}")
+        if int(dv.numel()) != int(pos.size(0)):
+            raise ValueError(
+                f"dual_volume node count mismatch: got {int(dv.numel())}, expected {int(pos.size(0))}"
+            )
+        valid_dv = torch.isfinite(dv) & (dv > 0)
+        if bool(valid_dv.any()):
+            area = torch.where(valid_dv, dv, area)
 
     return {
         "nx": nx,
@@ -2415,11 +2498,12 @@ def _physics_terms_dec_abs_point(
     x_abs: torch.Tensor,
     pos: torch.Tensor,
     edge_index: torch.Tensor,
+    dual_volume: Optional[torch.Tensor],
     cfg: Dict[str, Any],
     compute_adv: bool,
     compute_diff: bool,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
-    geom = _geometry_from_pos_edge(pos, edge_index)
+    geom = _geometry_from_pos_edge(pos, edge_index, dual_volume=dual_volume)
     nx = geom["nx"].to(device=x_abs.device, dtype=x_abs.dtype)
     ny = geom["ny"].to(device=x_abs.device, dtype=x_abs.dtype)
     face_len = geom["face_len"].to(device=x_abs.device, dtype=x_abs.dtype)
@@ -2493,6 +2577,7 @@ def _physics_terms_mls_abs_point(
     x_abs: torch.Tensor,
     pos: torch.Tensor,
     edge_index: torch.Tensor,
+    dual_volume: Optional[torch.Tensor],
     cfg: Dict[str, Any],
     compute_adv: bool,
     compute_diff: bool,
@@ -2530,7 +2615,7 @@ def _physics_terms_mls_abs_point(
         keep[:, sel_diff] = r_diff[:, sel_diff]
         r_diff = keep
 
-    geom = _geometry_from_pos_edge(pos, edge_index)
+    geom = _geometry_from_pos_edge(pos, edge_index, dual_volume=dual_volume)
     area = geom["area"].to(device=x_abs.device, dtype=torch.float32)
     if r_adv is not None:
         r_adv = r_adv.to(device=x_abs.device, dtype=torch.float32)
@@ -2565,6 +2650,7 @@ def _build_physics_extra_features(
     norm: NormStats,
     out_dtype: torch.dtype,
     device: torch.device,
+    dual_volume: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     if not _physics_inputs_enabled(cfg):
         return None
@@ -2582,6 +2668,7 @@ def _build_physics_extra_features(
     x_abs_f = x_abs.to(device=device, dtype=torch.float32)
     pos_f = pos.to(device=device, dtype=torch.float32)
     ei_f = edge_index.to(device=device, dtype=torch.long)
+    dv_f = None if dual_volume is None else dual_volume.to(device=device, dtype=torch.float32)
 
     backend = _physics_backend(cfg)
     if backend == "mls":
@@ -2589,6 +2676,7 @@ def _build_physics_extra_features(
             x_abs=x_abs_f,
             pos=pos_f,
             edge_index=ei_f,
+            dual_volume=dv_f,
             cfg=cfg,
             compute_adv=need_adv,
             compute_diff=need_diff,
@@ -2598,6 +2686,7 @@ def _build_physics_extra_features(
             x_abs=x_abs_f,
             pos=pos_f,
             edge_index=ei_f,
+            dual_volume=dv_f,
             cfg=cfg,
             compute_adv=need_adv,
             compute_diff=need_diff,
@@ -2663,18 +2752,15 @@ def _model_type_from_cfg(cfg: Dict[str, Any]) -> str:
     key = str(raw).strip().lower().replace("-", "_")
     sage_names = {"featurenet", "feature_net", "graphsage", "graph_sage", "sage", "sageconv"}
     mesh_names = {"meshgraphnet", "mesh_graph_net", "mgn"}
-    flux_names = {"fluxgraphnet", "fluxgnn", "flux"}
+    flux_names = {"fluxgraphnet", "flux_graph_net", "fluxgnn", "flux"}
     if key in sage_names:
         return "sageconv"
     if key in mesh_names:
         return "meshgraphnet"
     if key in flux_names:
-        raise ValueError(
-            "model.type='fluxgraphnet' is used in the 1D projects, but the Karman point-graph "
-            "trainer currently supports only 'sageconv' and 'meshgraphnet'."
-        )
+        return "fluxgraphnet"
     raise ValueError(
-        "Unsupported model.type/model.name. Use 'sageconv' or 'meshgraphnet'. "
+        "Unsupported model.type/model.name. Use 'sageconv', 'meshgraphnet', or 'fluxgraphnet'. "
         f"Got {raw!r}."
     )
 
@@ -2722,6 +2808,66 @@ def _build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int, device: torch.d
             make_score_head=False,
         ).to(device)
 
+    if model_type == "fluxgraphnet":
+        edge_pos_dim = int(mcfg.get("edge_pos_dim", 2))
+        edge_attr_channels = mcfg.get("edge_attr_channels", mcfg.get("edge_in_channels", None))
+        if edge_attr_channels is None:
+            edge_attr_channels = (2 * edge_pos_dim) + 1
+
+        rcfg = _relative_geometry_cfg(cfg)
+        bcfg = _boundary_mask_cfg(cfg)
+        domain_bbox = mcfg.get("domain_bbox", rcfg.get("domain_bbox", None))
+        if domain_bbox == "auto":
+            domain_bbox = None
+        center_xy = mcfg.get(
+            "cylinder_center_xy",
+            rcfg.get("center_xy", bcfg.get("center_xy", [0.0, 0.0])),
+        )
+        cylinder_radius = float(
+            mcfg.get("cylinder_radius", rcfg.get("radius", bcfg.get("radius", 0.5)))
+        )
+        cylinder_width = float(
+            mcfg.get(
+                "cylinder_boundary_width",
+                rcfg.get("band", bcfg.get("band", 0.08)),
+            )
+        )
+        return FluxGraphNet(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            hidden=int(mcfg.get("hidden", 128)),
+            layers=int(mcfg.get("layers", mcfg.get("processor_steps", 3))),
+            state_channel=int(mcfg.get("state_channel", 0)),
+            predict_type=mcfg.get("predict_type", "state"),
+            edge_attr_channels=int(edge_attr_channels),
+            edge_pos_dim=edge_pos_dim,
+            mlp_hidden_layers=int(mcfg.get("mlp_hidden_layers", 1)),
+            activation=str(mcfg.get("activation", "relu")),
+            activation_negative_slope=float(mcfg.get("activation_negative_slope", 0.01)),
+            activation_elu_alpha=float(mcfg.get("activation_elu_alpha", 1.0)),
+            use_layernorm=bool(mcfg.get("use_layernorm", mcfg.get("layer_norm", False))),
+            layernorm_eps=float(mcfg.get("layernorm_eps", 1e-6)),
+            dropout=float(mcfg.get("dropout", 0.0)),
+            aggregation=str(mcfg.get("aggregation", "sum")),
+            flux_scale=float(mcfg.get("flux_scale", 1.0)),
+            use_dual_volume=bool(mcfg.get("use_dual_volume", True)),
+            volume_floor=float(mcfg.get("volume_floor", 1e-12)),
+            use_open_boundary_source=bool(mcfg.get("use_open_boundary_source", True)),
+            open_boundary_mode=str(mcfg.get("open_boundary_mode", "learned_source")),
+            open_boundary_modes_by_side=mcfg.get("open_boundary_modes_by_side", None),
+            open_boundary_source_channels=mcfg.get("open_boundary_source_channels", None),
+            open_boundary_flux_sides=mcfg.get("open_boundary_flux_sides", None),
+            open_boundary_flux_scale=float(mcfg.get("open_boundary_flux_scale", 0.05)),
+            open_boundary_flux_outflow_only=bool(mcfg.get("open_boundary_flux_outflow_only", True)),
+            boundary_width=float(mcfg.get("boundary_width", 0.02)),
+            domain_bbox=domain_bbox,
+            cylinder_center_xy=center_xy,
+            cylinder_radius=cylinder_radius,
+            cylinder_boundary_width=cylinder_width,
+            velocity_channels=mcfg.get("velocity_channels", [0, 1]),
+            make_score_head=False,
+        ).to(device)
+
     raise RuntimeError(f"Unexpected normalized model type: {model_type!r}")
 
 
@@ -2730,8 +2876,11 @@ def _forward_model(
     x_model: torch.Tensor,
     edge_index: torch.Tensor,
     pos: torch.Tensor,
+    dual_volume: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     if bool(getattr(model, "uses_edge_geometry", False)):
+        if bool(getattr(model, "uses_dual_volume", False)):
+            return model(x_model, edge_index, pos=pos, dual_volume=dual_volume)
         return model(x_model, edge_index, pos=pos)
     return model(x_model, edge_index)
 
@@ -2764,6 +2913,12 @@ def _run_epoch(
         y = batch["y"].to(device=device, dtype=torch.float32)
         pos = batch["pos"].to(device=device, dtype=torch.float32)
         ei = batch["edge_index"].to(device=device, dtype=torch.long)
+        dual_volume_raw = batch.get("dual_volume", None)
+        dual_volume = (
+            None
+            if dual_volume_raw is None
+            else dual_volume_raw.to(device=device, dtype=torch.float32)
+        )
         dt_phys = _safe_dt_scalar(batch.get("t_src", None), batch.get("t_dst", None), default_dt=1.0)
 
         x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
@@ -2807,6 +2962,7 @@ def _run_epoch(
             x_abs=x,
             pos=pos,
             edge_index=ei,
+            dual_volume=dual_volume,
             dt_phys_scalar=dt_phys,
             cfg=cfg,
             norm=norm,
@@ -2820,7 +2976,7 @@ def _run_epoch(
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
-        y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos)
+        y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
         if use_huber:
             loss = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
         else:
@@ -2879,6 +3035,7 @@ def _run_epoch_multi_step(
         y_list = batch.get("y_list", None)
         pos_list = batch.get("pos_list", None)
         edge_index_list = batch.get("edge_index_list", None)
+        dual_volume_list = batch.get("dual_volume_list", None)
         t_list = batch.get("t_list", None)
         if not isinstance(x_list, list) or not isinstance(y_list, list):
             raise RuntimeError("Multi-step mode requires batch keys: x_list, y_list, pos_list, edge_index_list.")
@@ -2898,6 +3055,11 @@ def _run_epoch_multi_step(
             y_tgt_abs = y_list[k].to(device=device, dtype=torch.float32)
             pos = pos_list[k].to(device=device, dtype=torch.float32)
             ei = edge_index_list[k].to(device=device, dtype=torch.long)
+            dual_volume = None
+            if isinstance(dual_volume_list, list) and k < len(dual_volume_list):
+                dual_raw = dual_volume_list[k]
+                if dual_raw is not None:
+                    dual_volume = dual_raw.to(device=device, dtype=torch.float32)
 
             # Shock-ramp style chaining: model output at k feeds input at k+1.
             if autoregressive and (k > 0) and (x_roll_abs is not None):
@@ -2973,6 +3135,7 @@ def _run_epoch_multi_step(
                 x_abs=x_in_abs,
                 pos=pos,
                 edge_index=ei,
+                dual_volume=dual_volume,
                 dt_phys_scalar=dt_phys,
                 cfg=cfg,
                 norm=norm,
@@ -2984,7 +3147,7 @@ def _run_epoch_multi_step(
             x_model = torch.cat(x_parts, dim=1)
 
             with torch.set_grad_enabled(train_mode):
-                y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos)
+                y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
                 if use_huber:
                     loss_k = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
                 else:
@@ -3220,6 +3383,7 @@ def main(config_path: str) -> None:
     )
     out_dim = dataset_for_dims.y_dim
     model = _build_model(cfg, in_dim=in_dim, out_dim=out_dim, device=device)
+    has_dual_volume = bool(getattr(dataset_for_dims, "has_dual_volume", False))
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -3249,6 +3413,7 @@ def main(config_path: str) -> None:
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"dual_volume={has_dual_volume} "
                 f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
                 f"autoregressive={multi_step_autoreg} reverse_time={reverse_time}"
             )
@@ -3258,6 +3423,7 @@ def main(config_path: str) -> None:
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"files(train={n_train_files}, val={n_val_files}, test={n_test_files}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"dual_volume={has_dual_volume} "
                 f"reverse_time={reverse_time}"
             )
     else:
@@ -3266,6 +3432,7 @@ def main(config_path: str) -> None:
                 f"[INFO] dataset windows={n_total} "
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"dual_volume={has_dual_volume} "
                 f"window_size={window_size} stride={stride} rollout_steps={rollout_steps} "
                 f"autoregressive={multi_step_autoreg} reverse_time={reverse_time}"
             )
@@ -3274,6 +3441,7 @@ def main(config_path: str) -> None:
                 f"[INFO] dataset pairs={n_total} "
                 f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}) "
                 f"x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim} pos_dim={dataset_for_dims.pos_dim} "
+                f"dual_volume={has_dual_volume} "
                 f"reverse_time={reverse_time}"
             )
     if normalize and stats.x_mu is not None:
@@ -3343,6 +3511,16 @@ def main(config_path: str) -> None:
         print(
             f"[INFO] physics inputs enabled: backend={_physics_backend(cfg)} "
             f"extra_in_channels={physics_extra_dim}"
+        )
+    if _model_type_from_cfg(cfg) == "fluxgraphnet":
+        mcfg = cfg.get("model", {}) or {}
+        print(
+            "[INFO] FluxGraphNet enabled: "
+            "edge fluxes are canonicalized over unique undirected mesh edges; "
+            f"open_boundary_mode={mcfg.get('open_boundary_mode', 'learned_source')} "
+            f"use_dual_volume={bool(mcfg.get('use_dual_volume', True))} "
+            f"domain_bbox={mcfg.get('domain_bbox', relative_geometry_cfg.get('domain_bbox', None))} "
+            f"cylinder_radius={float(mcfg.get('cylinder_radius', relative_geometry_cfg.get('radius', 0.5)))}"
         )
 
     for ep in range(1, epochs + 1):
@@ -3527,6 +3705,7 @@ def main(config_path: str) -> None:
                 "split_file_counts": (
                     None if split_files is None else {k: len(v) for k, v in split_files.items()}
                 ),
+                "has_dual_volume": bool(has_dual_volume),
                 "num_workers": int(data_cfg.get("num_workers", 0)),
                 "reverse_time": bool(reverse_time),
                 "use_y_as_target": bool(data_cfg.get("use_y_as_target", True)),
@@ -3600,6 +3779,7 @@ def main(config_path: str) -> None:
                 "parc_predict_type": str(physics_cfg.get("parc_predict_type", "rate")),
                 "parc_detach_inputs": bool(physics_cfg.get("parc_detach_inputs", True)),
                 "parc_input_weighted": bool(physics_cfg.get("parc_input_weighted", False)),
+                "cached_dual_volume_area": bool(has_dual_volume),
                 "mls_ops_device": str(physics_cfg.get("mls_ops_device", "cpu")),
                 "mls_use_2hop_extension": bool(physics_cfg.get("mls_use_2hop_extension", True)),
                 "mls_use_neighbor_damping": bool(physics_cfg.get("mls_use_neighbor_damping", True)),
@@ -3632,7 +3812,11 @@ def main(config_path: str) -> None:
                         "edge_attr_channels",
                         (cfg.get("model", {}) or {}).get(
                             "edge_in_channels",
-                            int((cfg.get("model", {}) or {}).get("edge_pos_dim", 2)) + 1,
+                            (
+                                (2 * int((cfg.get("model", {}) or {}).get("edge_pos_dim", 2)) + 1)
+                                if _model_type_from_cfg(cfg) == "fluxgraphnet"
+                                else int((cfg.get("model", {}) or {}).get("edge_pos_dim", 2)) + 1
+                            ),
                         ),
                     )
                 ),
@@ -3654,6 +3838,19 @@ def main(config_path: str) -> None:
                 ),
                 "layernorm_eps": float((cfg.get("model", {}) or {}).get("layernorm_eps", 1e-6)),
                 "dropout": float((cfg.get("model", {}) or {}).get("dropout", 0.0)),
+                "predict_type": str((cfg.get("model", {}) or {}).get("predict_type", "state")),
+                "use_open_boundary_source": bool(
+                    (cfg.get("model", {}) or {}).get("use_open_boundary_source", True)
+                ),
+                "open_boundary_mode": str(
+                    (cfg.get("model", {}) or {}).get("open_boundary_mode", "learned_source")
+                ),
+                "open_boundary_modes_by_side": (cfg.get("model", {}) or {}).get(
+                    "open_boundary_modes_by_side",
+                    None,
+                ),
+                "boundary_width": float((cfg.get("model", {}) or {}).get("boundary_width", 0.02)),
+                "use_dual_volume": bool((cfg.get("model", {}) or {}).get("use_dual_volume", True)),
             },
             "derived": {
                 "dataset_mode": "window" if use_window_mode else "pair",

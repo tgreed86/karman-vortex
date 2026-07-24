@@ -5,11 +5,13 @@ rollout_viz_basic_point.py
 Rollout visualization for the point-graph baseline (train_basic_point.py).
 
 Writes one GIF per feature.
-Default frame layout is 2x2:
-  [ GT(t+1), Pred(t+1) ]
-  [ dGT,     Pred-GT   ]
-Optional frame layout (`--pred-gt-only`) is 1x2:
-  [ Pred(t+1), GT(t+1) ]
+Default frame layout is 3x1:
+  [ GT(t+1)   ]
+  [ Pred(t+1) ]
+  [ Pred-GT   ]
+Optional frame layout (`--pred-gt-only`) is 2x1:
+  [ Pred(t+1) ]
+  [ GT(t+1)   ]
 
 Supports:
   - teacher-forced one-step rollout (always valid)
@@ -164,6 +166,14 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
     pos = _as_2d_float(pos_raw, "pos")
     edge_index = _as_edge_index(edge_raw)
     n_nodes = int(pos.size(0))
+    dual_volume_key = None
+    dual_volume = None
+    for vk in ("dual_volume", "dual_volumes", "control_volume", "control_volumes", "cell_area", "cell_areas", "node_area", "node_areas"):
+        vv = obj.get(vk, None)
+        if vv is not None:
+            dual_volume_key = vk
+            dual_volume = _as_optional_node_scalar(vv, vk, n_nodes)
+            break
 
     x_tnf = _coerce_time_series_to_tnf(torch.as_tensor(x_raw, dtype=torch.float32), n_nodes, x_key)
     T = int(x_tnf.size(0))
@@ -206,6 +216,7 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
         "time_start": obj.get("time_start", None),
         "time_end": obj.get("time_end", None),
         "source_x_key": x_key,
+        "dual_volume_key": dual_volume_key,
     }
 
     print(
@@ -221,6 +232,7 @@ def _extract_case_level_series(obj: Dict[str, Any]) -> Optional[List[Dict[str, A
                 "y": (None if y_tnf is None else y_tnf[i]),
                 "pos": pos,
                 "edge_index": edge_index,
+                "dual_volume": dual_volume,
                 "time": float(time_vec[i].item()),
                 "global_params": gp_base,
             }
@@ -251,6 +263,17 @@ def _as_2d_float(x: Any, name: str) -> torch.Tensor:
     if t.ndim != 2:
         raise ValueError(f"{name} must be 2D, got {tuple(t.shape)}")
     return t
+
+
+def _as_optional_node_scalar(x: Any, name: str, n_nodes: int) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    t = _as_2d_float(x, name)
+    if t.size(0) != n_nodes and t.size(0) == 1 and t.size(1) == n_nodes:
+        t = t.t().contiguous()
+    if t.size(0) != n_nodes:
+        raise ValueError(f"{name} must have one row per node ({n_nodes}), got shape {tuple(t.shape)}")
+    return t[:, :1].contiguous()
 
 
 def _as_edge_index(x: Any) -> torch.Tensor:
@@ -300,6 +323,14 @@ def _extract_step_fields(step: Any) -> Dict[str, Any]:
     y = _extract_attr(step, "y", None)
     pos = _extract_attr(step, "pos", _extract_attr(step, "xy", None))
     ei = _extract_attr(step, "edge_index", _extract_attr(step, "ei", None))
+    dual_volume_raw = None
+    dual_volume_name = None
+    for vk in ("dual_volume", "dual_volumes", "control_volume", "control_volumes", "cell_area", "cell_areas", "node_area", "node_areas"):
+        vv = _extract_attr(step, vk, None)
+        if vv is not None:
+            dual_volume_raw = vv
+            dual_volume_name = vk
+            break
     if x is None or pos is None or ei is None:
         missing = []
         if x is None:
@@ -309,11 +340,17 @@ def _extract_step_fields(step: Any) -> Dict[str, Any]:
         if ei is None:
             missing.append("edge_index/ei")
         raise KeyError(f"Timestep missing required fields: {', '.join(missing)}")
+    pos_t = _as_2d_float(pos, "pos")
     return {
         "x": _as_2d_float(x, "x"),
         "y": None if y is None else _as_2d_float(y, "y"),
-        "pos": _as_2d_float(pos, "pos"),
+        "pos": pos_t,
         "edge_index": _as_edge_index(ei),
+        "dual_volume": (
+            None
+            if dual_volume_raw is None
+            else _as_optional_node_scalar(dual_volume_raw, str(dual_volume_name), int(pos_t.size(0)))
+        ),
         "time": _extract_time(step),
         "global_params": _extract_attr(step, "global_params", None),
     }
@@ -340,7 +377,8 @@ def _induce_subgraph(
     pos: torch.Tensor,
     edge_index: torch.Tensor,
     keep_idx: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dual_volume: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     keep_idx = keep_idx.to(torch.long)
     n = x.size(0)
     remap = torch.full((n,), -1, dtype=torch.long)
@@ -358,7 +396,12 @@ def _induce_subgraph(
         & (remap[dst] >= 0)
     )
     ei = torch.stack([remap[src[valid]], remap[dst[valid]]], dim=0)
-    return x.index_select(0, keep_idx), pos.index_select(0, keep_idx), ei
+    return (
+        x.index_select(0, keep_idx),
+        pos.index_select(0, keep_idx),
+        ei,
+        None if dual_volume is None else dual_volume.index_select(0, keep_idx),
+    )
 
 
 def _maybe_norm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[torch.Tensor]) -> torch.Tensor:
@@ -619,6 +662,52 @@ def _enforce_gif_duration_ms(gif_path: str, duration_ms: int) -> bool:
         return False
 
 
+def _write_rgb_gif_fixed_palette(gif_path: str, frames: List[np.ndarray], duration_ms: int) -> bool:
+    """
+    Save RGB frames using one global GIF palette.
+    This avoids frame-to-frame colorbar palette shimmer in animated GIFs.
+    """
+    if len(frames) == 0:
+        return False
+
+    try:
+        from PIL import Image
+    except Exception:
+        imageio.mimsave(gif_path, frames, duration=float(duration_ms) / 1000.0, loop=0)
+        return False
+
+    try:
+        palette_enum = getattr(Image, "Palette", None)
+        dither_enum = getattr(Image, "Dither", None)
+        adaptive = getattr(palette_enum, "ADAPTIVE", None)
+        if adaptive is None:
+            adaptive = getattr(Image, "ADAPTIVE", 1)
+        no_dither = getattr(dither_enum, "NONE", None)
+        if no_dither is None:
+            no_dither = getattr(Image, "NONE", 0)
+
+        rgb_frames = [Image.fromarray(np.asarray(frame, dtype=np.uint8)) for frame in frames]
+        # Each frame contains full colorbars, so the first frame is a good global palette source.
+        palette_frame = rgb_frames[0].convert("P", palette=adaptive, colors=256, dither=no_dither)
+        paletted = [
+            im.quantize(palette=palette_frame, dither=no_dither)
+            for im in rgb_frames
+        ]
+        paletted[0].save(
+            gif_path,
+            save_all=True,
+            append_images=paletted[1:],
+            duration=int(max(1, duration_ms)),
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
+        return True
+    except Exception:
+        imageio.mimsave(gif_path, frames, duration=float(duration_ms) / 1000.0, loop=0)
+        return False
+
+
 def run_rollout(
     *,
     model: torch.nn.Module,
@@ -685,6 +774,7 @@ def run_rollout(
         x_t = _select_columns(s_t["x"], x_cols)
         pos_t = _select_columns(s_t["pos"], pos_cols)
         ei_t = s_t["edge_index"]
+        dual_volume_t = s_t.get("dual_volume", None)
 
         if use_y_target and (s_t["y"] is not None):
             y_target = _select_columns(s_t["y"], y_cols)
@@ -703,7 +793,13 @@ def run_rollout(
             if gid < 0 or gid >= len(groups):
                 raise ValueError(f"Requested z_slice={gid}, but only {len(groups)} groups available at t={t}.")
             keep = groups[gid]
-            x_t, pos_t, ei_t = _induce_subgraph(x_t, pos_t, ei_t, keep)
+            x_t, pos_t, ei_t, dual_volume_t = _induce_subgraph(
+                x_t,
+                pos_t,
+                ei_t,
+                keep,
+                dual_volume=dual_volume_t,
+            )
             y_target = y_target.index_select(0, keep)
 
         if x_t.size(0) != y_target.size(0):
@@ -727,6 +823,11 @@ def run_rollout(
         x_in = _maybe_norm(x_abs_dev, norm_x_mu, norm_x_std)
         pos_dev = pos_t.to(device=device, dtype=torch.float32)
         ei_dev = ei_t.to(device=device, dtype=torch.long)
+        dual_volume_dev = (
+            None
+            if dual_volume_t is None
+            else dual_volume_t.to(device=device, dtype=torch.float32)
+        )
 
         include_pos = bool(feat_cfg.get("include_pos", True))
         pos_in = _maybe_norm(pos_dev, norm_pos_mu, norm_pos_std) if include_pos else None
@@ -768,6 +869,7 @@ def run_rollout(
                 x_abs=x_abs_dev,
                 pos=pos_dev,
                 edge_index=ei_dev,
+                dual_volume=dual_volume_dev,
                 dt_phys_scalar=dt_phys,
                 cfg=cfg,
                 norm=norm_obj,
@@ -848,7 +950,7 @@ def make_rollout_gifs(
     # Compute fixed color limits across rollout per feature.
     top_min = np.full((F,), np.inf, dtype=np.float64)
     top_max = np.full((F,), -np.inf, dtype=np.float64)
-    d_abs = np.zeros((F,), dtype=np.float64)
+    err_abs = np.zeros((F,), dtype=np.float64)
 
     for ex in examples:
         gt_t = ex["gt_t"].numpy()
@@ -869,9 +971,9 @@ def make_rollout_gifs(
                 top_max[f] = max(top_max[f], float(np.nanmax(aa)))
 
             if not pred_gt_only:
-                # Anchor delta-row color limits to GT delta only.
-                d1 = gt_tp1[:, f] - gt_t[:, f]
-                for d in (d1,):
+                # Anchor residual color limits to Pred-GT over the full rollout.
+                err = pred[:, f] - gt_tp1[:, f]
+                for d in (err,):
                     if d.size == 0:
                         continue
                     if clim_sample > 0 and d.size > clim_sample:
@@ -879,181 +981,162 @@ def make_rollout_gifs(
                         dd = d[::step]
                     else:
                         dd = d
-                    d_abs[f] = max(d_abs[f], float(np.nanmax(np.abs(dd))))
+                    err_abs[f] = max(err_abs[f], float(np.nanmax(np.abs(dd))))
 
     top_pad = 1e-12
     top_equal = (top_max - top_min) < top_pad
     top_max[top_equal] = top_min[top_equal] + 1.0
     if not pred_gt_only:
-        d_abs = np.maximum(d_abs, 1e-12)
+        err_abs = np.maximum(err_abs, 1e-12)
 
     gif_paths: List[str] = []
-    writers = []
     fps_i = max(1, int(fps))
     frame_ms = int(round(1000.0 / float(fps_i)))
-    duration_s = frame_ms / 1000.0
     for f in range(F):
         nm = _safe_name(feature_names[f])
         p = os.path.join(out_dir, f"rollout_{f:02d}_{nm}.gif")
         gif_paths.append(p)
-        writers.append(
-            imageio.get_writer(
-                p,
-                mode="I",
-                fps=fps_i,
-                duration=duration_s,
-                loop=0,
+    frames_by_feature: List[List[np.ndarray]] = [[] for _ in range(F)]
+
+    # Keep a stable plotted subset for each encountered node count.
+    # This avoids per-frame "TV static" flicker when max_points < N.
+    pick_cache: Dict[int, np.ndarray] = {}
+    tri_cache: Dict[int, Optional[mtri.Triangulation]] = {}
+    frame_examples = list(reversed(examples)) if bool(reverse_time) else examples
+    for k, ex in enumerate(frame_examples):
+        pos = ex["pos"].numpy()
+        gt_tp1 = ex["gt_tp1"].numpy()
+        pred = ex["pred_tp1"].numpy()
+
+        d_pg = pred - gt_tp1
+        n = pos.shape[0]
+        if n not in pick_cache:
+            pick_cache[n] = _sample_indices(n, max_points=max_points, seed=int(sample_seed))
+        if (render_mode == "tri") and (n not in tri_cache):
+            tri_cache[n] = _build_triangulation(
+                pos,
+                point_idx=pick_cache[n],
+                edge_quantile=float(tri_edge_quantile),
+                edge_factor=float(tri_edge_factor),
             )
-        )
+        pick = pick_cache[n]
+        tri = tri_cache.get(n, None)
 
-    try:
-        # Keep a stable plotted subset for each encountered node count.
-        # This avoids per-frame "TV static" flicker when max_points < N.
-        pick_cache: Dict[int, np.ndarray] = {}
-        tri_cache: Dict[int, Optional[mtri.Triangulation]] = {}
-        frame_examples = list(reversed(examples)) if bool(reverse_time) else examples
-        for k, ex in enumerate(frame_examples):
-            pos = ex["pos"].numpy()
-            gt_t = ex["gt_t"].numpy()
-            gt_tp1 = ex["gt_tp1"].numpy()
-            pred = ex["pred_tp1"].numpy()
+        for f in range(F):
+            if pred_gt_only:
+                fig, ax = plt.subplots(2, 1, figsize=(7.0, 8.0), dpi=130, squeeze=False)
 
-            d_gt = gt_tp1 - gt_t
-            d_pg = pred - gt_tp1
-            n = pos.shape[0]
-            if n not in pick_cache:
-                pick_cache[n] = _sample_indices(n, max_points=max_points, seed=int(sample_seed))
-            if (render_mode == "tri") and (n not in tri_cache):
-                tri_cache[n] = _build_triangulation(
-                    pos,
-                    point_idx=pick_cache[n],
-                    edge_quantile=float(tri_edge_quantile),
-                    edge_factor=float(tri_edge_factor),
+                sc_pred = (
+                    _tri_panel if render_mode == "tri" else _scatter_panel
+                )(
+                    ax[0, 0], pos, pred[:, f],
+                    tri=tri,
+                    point_idx=pick,
+                    vmin=float(top_min[f]), vmax=float(top_max[f]),
+                    cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
                 )
-            pick = pick_cache[n]
-            tri = tri_cache.get(n, None)
+                sc_gt = (
+                    _tri_panel if render_mode == "tri" else _scatter_panel
+                )(
+                    ax[1, 0], pos, gt_tp1[:, f],
+                    tri=tri,
+                    point_idx=pick,
+                    vmin=float(top_min[f]), vmax=float(top_max[f]),
+                    cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
+                )
 
-            for f in range(F):
-                if pred_gt_only:
-                    fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.8), dpi=130, squeeze=False)
+                ax[0, 0].set_title("Pred(t+1)")
+                ax[1, 0].set_title("GT(t+1)")
 
-                    sc_pred = (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[0, 0], pos, pred[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=float(top_min[f]), vmax=float(top_max[f]),
-                        cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
-                    (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[0, 1], pos, gt_tp1[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=float(top_min[f]), vmax=float(top_max[f]),
-                        cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
+                t_abs = ex.get("t", k)
+                t_next = ex.get("t_next", t_abs + 1)
+                abs_time = _fmt_abs_time(ex.get("time_tp1", None))
+                mae = ex.get("mae", float("nan"))
+                fig.suptitle(
+                    f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                    f"feat={feature_names[f]}  mae={mae:.3e}  "
+                    f"points={n} (plot {len(pick)})",
+                    fontsize=11,
+                )
+                fig.subplots_adjust(left=0.07, right=0.86, bottom=0.06, top=0.91, hspace=0.24)
+                ticks = np.linspace(float(top_min[f]), float(top_max[f]), 5)
+                for sc, y0 in ((sc_pred, 0.55), (sc_gt, 0.12)):
+                    cax = fig.add_axes([0.88, y0, 0.025, 0.32])
+                    fig.colorbar(sc, cax=cax, ticks=ticks)
+            else:
+                fig, ax = plt.subplots(3, 1, figsize=(7.4, 11.2), dpi=130, squeeze=False)
 
-                    ax[0, 0].set_title("Pred(t+1)")
-                    ax[0, 1].set_title("GT(t+1)")
+                sc_gt = (
+                    _tri_panel if render_mode == "tri" else _scatter_panel
+                )(
+                    ax[0, 0], pos, gt_tp1[:, f],
+                    tri=tri,
+                    point_idx=pick,
+                    vmin=float(top_min[f]), vmax=float(top_max[f]),
+                    cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
+                )
+                sc_pred = (
+                    _tri_panel if render_mode == "tri" else _scatter_panel
+                )(
+                    ax[1, 0], pos, pred[:, f],
+                    tri=tri,
+                    point_idx=pick,
+                    vmin=float(top_min[f]), vmax=float(top_max[f]),
+                    cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
+                )
 
-                    t_abs = ex.get("t", k)
-                    t_next = ex.get("t_next", t_abs + 1)
-                    abs_time = _fmt_abs_time(ex.get("time_tp1", None))
-                    mae = ex.get("mae", float("nan"))
-                    fig.suptitle(
-                        f"t={t_abs}->{t_next}  abs_time={abs_time}  "
-                        f"feat={feature_names[f]}  mae={mae:.3e}  "
-                        f"points={n} (plot {len(pick)})",
-                        fontsize=11,
-                    )
-                    fig.subplots_adjust(left=0.04, right=0.90, bottom=0.09, top=0.87, wspace=0.12)
-                    cax_top = fig.add_axes([0.915, 0.14, 0.016, 0.70])
-                    fig.colorbar(sc_pred, cax=cax_top)
-                else:
-                    fig, ax = plt.subplots(2, 2, figsize=(11.0, 8.2), dpi=130)
+                elim = float(err_abs[f])
+                sc_err = (
+                    _tri_panel if render_mode == "tri" else _scatter_panel
+                )(
+                    ax[2, 0], pos, d_pg[:, f],
+                    tri=tri,
+                    point_idx=pick,
+                    vmin=-elim, vmax=elim,
+                    cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
+                )
 
-                    sc00 = (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[0, 0], pos, gt_tp1[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=float(top_min[f]), vmax=float(top_max[f]),
-                        cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
-                    (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[0, 1], pos, pred[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=float(top_min[f]), vmax=float(top_max[f]),
-                        cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
+                ax[0, 0].set_title(target_label)
+                ax[1, 0].set_title(f"Pred({target_label})")
+                ax[2, 0].set_title(f"Pred-{target_label}")
 
-                    dlim = float(d_abs[f])
-                    sc10 = (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[1, 0], pos, d_gt[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=-dlim, vmax=dlim,
-                        cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
-                    (
-                        _tri_panel if render_mode == "tri" else _scatter_panel
-                    )(
-                        ax[1, 1], pos, d_pg[:, f],
-                        tri=tri,
-                        point_idx=pick,
-                        vmin=-dlim, vmax=dlim,
-                        cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
-                    )
+                t_abs = ex.get("t", k)
+                t_next = ex.get("t_next", t_abs + 1)
+                abs_time = _fmt_abs_time(ex.get("time_tp1", None))
+                mae = ex.get("mae", float("nan"))
+                fig.suptitle(
+                    f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                    f"feat={feature_names[f]}  mae={mae:.3e}  "
+                    f"points={n} (plot {len(pick)})",
+                    fontsize=11,
+                )
+                fig.subplots_adjust(left=0.07, right=0.86, bottom=0.045, top=0.925, hspace=0.32)
+                top_ticks = np.linspace(float(top_min[f]), float(top_max[f]), 5)
+                err_ticks = np.linspace(-elim, elim, 5)
+                for sc, y0, ticks in (
+                    (sc_gt, 0.675, top_ticks),
+                    (sc_pred, 0.375, top_ticks),
+                    (sc_err, 0.075, err_ticks),
+                ):
+                    cax = fig.add_axes([0.88, y0, 0.025, 0.215])
+                    fig.colorbar(sc, cax=cax, ticks=ticks)
 
-                    ax[0, 0].set_title(target_label)
-                    ax[0, 1].set_title(f"Pred({target_label})")
-                    ax[1, 0].set_title(f"dGT = {target_label}-{input_label}")
-                    ax[1, 1].set_title(f"Pred-{target_label}")
+            fig.canvas.draw()
+            buf = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            frames_by_feature[f].append(buf[:, :, :3].copy())
+            plt.close(fig)
 
-                    t_abs = ex.get("t", k)
-                    t_next = ex.get("t_next", t_abs + 1)
-                    abs_time = _fmt_abs_time(ex.get("time_tp1", None))
-                    mae = ex.get("mae", float("nan"))
-                    fig.suptitle(
-                        f"t={t_abs}->{t_next}  abs_time={abs_time}  "
-                        f"feat={feature_names[f]}  mae={mae:.3e}  "
-                        f"points={n} (plot {len(pick)})",
-                        fontsize=11,
-                    )
-                    # Reserve right margin for dedicated row colorbars to avoid overlap.
-                    fig.subplots_adjust(left=0.04, right=0.90, bottom=0.05, top=0.91, wspace=0.12, hspace=0.18)
-                    cax_top = fig.add_axes([0.915, 0.56, 0.016, 0.31])
-                    cax_bot = fig.add_axes([0.915, 0.12, 0.016, 0.31])
-                    fig.colorbar(sc00, cax=cax_top)
-                    fig.colorbar(sc10, cax=cax_bot)
+        print(f"[GIF] frame {k + 1}/{len(frame_examples)} complete")
 
-                fig.canvas.draw()
-                buf = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
-                writers[f].append_data(buf[:, :, :3], meta={"duration": duration_s})
-                plt.close(fig)
-
-            print(f"[GIF] frame {k + 1}/{len(frame_examples)} complete")
-
-    finally:
-        for w in writers:
-            w.close()
-
-    # Safari can ignore duration metadata from some encoders; enforce after write.
-    fixed = 0
-    for p in gif_paths:
-        if _enforce_gif_duration_ms(p, frame_ms):
-            fixed += 1
-    if fixed > 0:
-        print(f"[GIF] duration metadata normalized for {fixed}/{len(gif_paths)} files ({frame_ms} ms/frame)")
+    fixed_palette = 0
+    for f, p in enumerate(gif_paths):
+        if _write_rgb_gif_fixed_palette(p, frames_by_feature[f], frame_ms):
+            fixed_palette += 1
+    if fixed_palette > 0:
+        print(
+            f"[GIF] wrote {fixed_palette}/{len(gif_paths)} files with a fixed global palette "
+            f"({frame_ms} ms/frame)"
+        )
 
     return gif_paths
 
@@ -1155,6 +1238,7 @@ def main() -> None:
     steps = [_extract_step_fields(s) for s in raw_steps]
     use_y_target = bool(cfg.get("data", {}).get("use_y_as_target", True))
     has_y_targets = any((s.get("y", None) is not None) for s in steps[: min(5, len(steps))])
+    has_dual_volume = any((s.get("dual_volume", None) is not None) for s in steps[: min(5, len(steps))])
     if use_y_target and has_y_targets:
         target_label = "Target y(t)"
     else:
@@ -1230,6 +1314,7 @@ def main() -> None:
         "used_autoregressive": bool(used_autoreg),
         "z_slice": args.z_slice,
         "source_reynolds": (None if source_reynolds is None else float(source_reynolds)),
+        "has_dual_volume": bool(has_dual_volume),
         "mean_mae": mean_mae,
         "target_label": target_label,
         "input_label": input_label,
