@@ -8,6 +8,7 @@ Examples:
   python utils/plot_training_history.py \
       --log-csv runs_karman_basic/test/train_log.csv \
       --metric both \
+      --skip-first-n-epochs 10 \
       --out runs_karman_basic/test/training_curves.png \
       --no-show
 """
@@ -40,6 +41,13 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--title", type=str, default=None, help="Optional plot title override.")
     ap.add_argument("--logy", action="store_true", help="Use logarithmic y-axis.")
+    ap.add_argument(
+        "--skip-first-n-epochs",
+        "--skip-first-epochs",
+        type=int,
+        default=0,
+        help="Drop the first N distinct epoch values before plotting; epoch labels are unchanged.",
+    )
     ap.add_argument(
         "--out",
         type=Path,
@@ -86,6 +94,36 @@ def _to_float_or_nan(v: str) -> float:
         return float(v)
     except Exception:
         return float("nan")
+
+
+def _skip_first_epochs(rows: List[Dict[str, str]], n_epochs: int) -> List[Dict[str, str]]:
+    if n_epochs < 0:
+        raise ValueError("--skip-first-n-epochs must be >= 0.")
+    if n_epochs == 0:
+        return rows
+
+    epochs = []
+    for r in rows:
+        ep = _to_float_or_nan(str(r.get("epoch", "")))
+        if np.isfinite(ep):
+            epochs.append(int(round(ep)))
+
+    unique_epochs = sorted(set(epochs))
+    skipped = set(unique_epochs[: int(n_epochs)])
+    kept = []
+    for r in rows:
+        ep = _to_float_or_nan(str(r.get("epoch", "")))
+        if not np.isfinite(ep):
+            kept.append(r)
+            continue
+        if int(round(ep)) not in skipped:
+            kept.append(r)
+    if len(kept) == 0:
+        raise ValueError(
+            f"--skip-first-n-epochs={n_epochs} removed all rows "
+            f"({len(unique_epochs)} distinct epochs found)."
+        )
+    return kept
 
 
 def _extract_series(rows: List[Dict[str, str]], metric: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
@@ -150,6 +188,7 @@ def main() -> None:
     out_path = _resolve_out_path(args, log_csv_path=log_csv_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows = _load_rows(log_csv_path)
+    rows = _skip_first_epochs(rows, int(args.skip_first_n_epochs))
 
     import matplotlib
 

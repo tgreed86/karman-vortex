@@ -52,7 +52,15 @@ from torch import optim
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from torch_geometric.data import Data
 
-from models import FeatureNet, FluxGraphNet, MeshGraphNet
+from models import (
+    FeatureNet,
+    FluxGraphNet,
+    MeshGraphNet,
+    PREDICT_TYPE_DELTA,
+    PREDICT_TYPE_RATE,
+    PREDICT_TYPE_STATE,
+    _normalize_predict_type,
+)
 import utils.dec_ops as dec
 import utils.mls as mls
 
@@ -2158,6 +2166,120 @@ def _maybe_denorm(x: torch.Tensor, mu: Optional[torch.Tensor], std: Optional[tor
     return x * std_ + mu_
 
 
+def _predict_type_from_cfg(cfg: Dict[str, Any]) -> str:
+    mcfg = cfg.get("model", {}) or {}
+    return _normalize_predict_type(mcfg.get("predict_type", PREDICT_TYPE_STATE), default=PREDICT_TYPE_STATE)
+
+
+def _dt_ref_scalar_from_cfg(cfg: Dict[str, Any]) -> Optional[float]:
+    for section_name, key in (
+        ("model", "dt_ref"),
+        ("model", "rate_dt_ref"),
+        ("train", "dt_ref"),
+        ("data", "dt_ref"),
+    ):
+        section = cfg.get(section_name, {}) or {}
+        if key not in section:
+            continue
+        raw = section.get(key, None)
+        if raw is None:
+            continue
+        if isinstance(raw, str) and raw.strip().lower() in {"", "none", "null", "auto"}:
+            continue
+        try:
+            value = float(raw)
+        except Exception as exc:
+            raise ValueError(f"{section_name}.{key} must be a positive scalar or null, got {raw!r}.") from exc
+        if (not np.isfinite(value)) or value <= 0.0:
+            raise ValueError(f"{section_name}.{key} must be positive, got {raw!r}.")
+        return value
+    return None
+
+
+def _dt_hat_tensor(
+    dt_phys_scalar: float,
+    cfg: Dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    try:
+        dt_phys = abs(float(dt_phys_scalar))
+    except Exception:
+        dt_phys = 1.0
+    if (not np.isfinite(dt_phys)) or dt_phys <= 0.0:
+        dt_phys = 1.0
+
+    dt_ref = _dt_ref_scalar_from_cfg(cfg)
+    dt_hat = dt_phys if dt_ref is None else (dt_phys / float(dt_ref))
+    return torch.tensor(max(1e-12, float(dt_hat)), device=device, dtype=dtype)
+
+
+def _require_predict_state_shape(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    predict_type: str,
+    rhs_name: str,
+) -> None:
+    if lhs.shape == rhs.shape:
+        return
+    raise RuntimeError(
+        f"model.predict_type='{predict_type}' requires the normalized input state and {rhs_name} "
+        f"to have the same shape. Got input={tuple(lhs.shape)} {rhs_name}={tuple(rhs.shape)}. "
+        "Use matching data.target_columns/x_input_columns or set model.predict_type='state'."
+    )
+
+
+def _target_for_predict_type(
+    norm_in: torch.Tensor,
+    norm_tgt: torch.Tensor,
+    dt_hat: torch.Tensor,
+    predict_type: str,
+) -> torch.Tensor:
+    predict_type = _normalize_predict_type(predict_type, default=PREDICT_TYPE_STATE)
+    if predict_type == PREDICT_TYPE_STATE:
+        return norm_tgt
+
+    _require_predict_state_shape(
+        norm_in,
+        norm_tgt,
+        predict_type=predict_type,
+        rhs_name="target",
+    )
+    delta = norm_tgt - norm_in
+    if predict_type == PREDICT_TYPE_DELTA:
+        return delta
+    if predict_type == PREDICT_TYPE_RATE:
+        dt = dt_hat.to(device=delta.device, dtype=delta.dtype).clamp_min(1e-12)
+        return delta / dt
+    raise RuntimeError(f"Unexpected model.predict_type='{predict_type}'.")
+
+
+def _state_from_model_output(
+    norm_in: torch.Tensor,
+    model_out: torch.Tensor,
+    dt_hat: torch.Tensor,
+    predict_type: str,
+) -> torch.Tensor:
+    predict_type = _normalize_predict_type(predict_type, default=PREDICT_TYPE_STATE)
+    if predict_type == PREDICT_TYPE_STATE:
+        return model_out
+
+    _require_predict_state_shape(
+        norm_in,
+        model_out,
+        predict_type=predict_type,
+        rhs_name="model output",
+    )
+    if predict_type == PREDICT_TYPE_DELTA:
+        return norm_in + model_out
+    if predict_type == PREDICT_TYPE_RATE:
+        dt = dt_hat.to(device=model_out.device, dtype=model_out.dtype).clamp_min(1e-12)
+        return norm_in + (model_out * dt)
+    raise RuntimeError(f"Unexpected model.predict_type='{predict_type}'.")
+
+
 def _physics_inputs_enabled(cfg: Dict[str, Any]) -> bool:
     phys = _physics_cfg(cfg)
     include_adv = bool(phys.get("parc_include_adv", False))
@@ -2702,7 +2824,7 @@ def _build_physics_extra_features(
 
     sigma = None if norm.y_std is None else norm.y_std.to(device=device, dtype=torch.float32)
     dt_phys = torch.tensor(max(1e-12, abs(float(dt_phys_scalar))), device=device, dtype=torch.float32)
-    dt_ref_cfg = phys.get("dt_ref", None)
+    dt_ref_cfg = phys["dt_ref"] if "dt_ref" in phys else _dt_ref_scalar_from_cfg(cfg)
     dt_ref = None
     if dt_ref_cfg is not None:
         try:
@@ -2710,7 +2832,10 @@ def _build_physics_extra_features(
         except Exception:
             dt_ref = None
     form = str(phys.get("parc_input_form", "rate")).lower()
-    predict_type = str(phys.get("parc_predict_type", "rate")).lower()
+    predict_type = _normalize_predict_type(
+        phys.get("parc_predict_type", PREDICT_TYPE_RATE),
+        default=PREDICT_TYPE_RATE,
+    )
 
     fdim = int(x_abs.size(1))
     sel_adv = _physics_channel_indices(cfg, fdim, "adv")
@@ -2907,6 +3032,7 @@ def _run_epoch(
     loss_sum = 0.0
     mae_sum = 0.0
     n = 0
+    predict_type = _predict_type_from_cfg(cfg)
 
     for batch in loader:
         x = batch["x"].to(device=device, dtype=torch.float32)
@@ -2923,6 +3049,7 @@ def _run_epoch(
 
         x_in = _maybe_norm(x, norm.x_mu, norm.x_std)
         y_tgt = _maybe_norm(y, norm.y_mu, norm.y_std)
+        dt_hat = _dt_hat_tensor(dt_phys, cfg, device=x_in.device, dtype=x_in.dtype)
         pos_in = _maybe_norm(pos, norm.pos_mu, norm.pos_std) if include_pos else None
 
         x_parts = [x_in]
@@ -2976,11 +3103,12 @@ def _run_epoch(
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
-        y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
+        y_model_out, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
+        y_model_tgt = _target_for_predict_type(x_in, y_tgt, dt_hat, predict_type)
         if use_huber:
-            loss = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
+            loss = F.huber_loss(y_model_out, y_model_tgt, delta=float(huber_delta))
         else:
-            loss = F.mse_loss(y_pred_norm, y_tgt)
+            loss = F.mse_loss(y_model_out, y_model_tgt)
 
         if train_mode:
             loss.backward()
@@ -2989,6 +3117,7 @@ def _run_epoch(
             optimizer.step()
 
         with torch.no_grad():
+            y_pred_norm = _state_from_model_output(x_in, y_model_out, dt_hat, predict_type)
             y_pred = _maybe_denorm(y_pred_norm, norm.y_mu, norm.y_std)
             mae = (y_pred - y).abs().mean()
 
@@ -3029,6 +3158,7 @@ def _run_epoch_multi_step(
 
     warned_input_shape = False
     warned_chain_shape = False
+    predict_type = _predict_type_from_cfg(cfg)
 
     for batch in loader:
         x_list = batch.get("x_list", None)
@@ -3098,6 +3228,7 @@ def _run_epoch_multi_step(
                 dt_phys = _safe_dt_scalar(t_list[k], t_list[k + 1], default_dt=1.0)
             else:
                 dt_phys = 1.0
+            dt_hat = _dt_hat_tensor(dt_phys, cfg, device=x_in.device, dtype=x_in.dtype)
 
             x_parts = [x_in]
             re_extra = _build_reynolds_node_feature(
@@ -3147,17 +3278,19 @@ def _run_epoch_multi_step(
             x_model = torch.cat(x_parts, dim=1)
 
             with torch.set_grad_enabled(train_mode):
-                y_pred_norm, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
+                y_model_out, _score, _h = _forward_model(model, x_model, ei, pos, dual_volume=dual_volume)
+                y_model_tgt = _target_for_predict_type(x_in, y_tgt, dt_hat, predict_type)
                 if use_huber:
-                    loss_k = F.huber_loss(y_pred_norm, y_tgt, delta=float(huber_delta))
+                    loss_k = F.huber_loss(y_model_out, y_model_tgt, delta=float(huber_delta))
                 else:
-                    loss_k = F.mse_loss(y_pred_norm, y_tgt)
+                    loss_k = F.mse_loss(y_model_out, y_model_tgt)
 
             if train_mode:
                 window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
 
             with torch.no_grad():
-                y_pred_abs = _maybe_denorm(y_pred_norm.detach(), norm.y_mu, norm.y_std)
+                y_pred_norm = _state_from_model_output(x_in, y_model_out.detach(), dt_hat, predict_type)
+                y_pred_abs = _maybe_denorm(y_pred_norm, norm.y_mu, norm.y_std)
                 mae_k = float((y_pred_abs - y_tgt_abs).abs().mean().cpu().item())
 
             total_loss += float(loss_k.detach().cpu().item())
@@ -3210,6 +3343,8 @@ def main(config_path: str) -> None:
     feat_cfg = cfg.get("features", {}) or {}
     loss_cfg = cfg.get("loss", {}) or {}
     physics_cfg = _physics_cfg(cfg)
+    predict_type = _predict_type_from_cfg(cfg)
+    model_dt_ref = _dt_ref_scalar_from_cfg(cfg)
 
     window_size = int(train_cfg.get("window_size", 2))
     stride = int(train_cfg.get("stride", 1))
@@ -3260,6 +3395,11 @@ def main(config_path: str) -> None:
     else:
         rollout_steps = 1
         multi_step_autoreg = False
+    if (predict_type != PREDICT_TYPE_STATE) and bool(data_cfg.get("use_y_as_target", True)):
+        print(
+            f"[WARN] model.predict_type='{predict_type}' treats the supervised target as a next-state target. "
+            "Confirm data.y contains x(t+1)-style values, not same-time labels."
+        )
 
     include_pos = bool(feat_cfg.get("include_pos", True))
     include_reynolds, reynolds_mode = _reynolds_input_cfg(cfg)
@@ -3327,6 +3467,12 @@ def main(config_path: str) -> None:
     batch_size = int(train_cfg.get("batch_size", 1))
     if batch_size != 1:
         raise ValueError("train_basic_point.py currently requires train.batch_size=1.")
+    if predict_type != PREDICT_TYPE_STATE and int(dataset_for_dims.x_dim) != int(dataset_for_dims.y_dim):
+        raise ValueError(
+            f"model.predict_type='{predict_type}' requires x_dim == y_dim so residual/rate outputs can be "
+            f"reconstructed into the next state. Got x_dim={dataset_for_dims.x_dim} y_dim={dataset_for_dims.y_dim}. "
+            "Use matching data.x_input_columns/data.target_columns or set model.predict_type='state'."
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -3470,6 +3616,8 @@ def main(config_path: str) -> None:
         print(f"[WARN] position normalization requested but stats were unavailable (mode={pos_norm_mode}).")
     else:
         print(f"[INFO] position normalization disabled (configured mode={pos_norm_mode}).")
+    dt_ref_msg = "none (using raw dt)" if model_dt_ref is None else f"{model_dt_ref:g}"
+    print(f"[INFO] model output predict_type={predict_type} dt_ref={dt_ref_msg}")
     if include_reynolds:
         print(f"[INFO] Reynolds conditioning enabled: mode={reynolds_mode} (channel_dim=1).")
     if include_relative_geometry:
@@ -3776,7 +3924,16 @@ def main(config_path: str) -> None:
                 "diff_weight": float(physics_cfg.get("diff_weight", 1.0)),
                 "nu": physics_cfg.get("nu", 0.0),
                 "parc_input_form": str(physics_cfg.get("parc_input_form", "rate")),
-                "parc_predict_type": str(physics_cfg.get("parc_predict_type", "rate")),
+                "parc_predict_type": (
+                    _normalize_predict_type(
+                        physics_cfg.get("parc_predict_type", PREDICT_TYPE_RATE),
+                        default=PREDICT_TYPE_RATE,
+                    )
+                    if _physics_inputs_enabled(cfg)
+                    else str(physics_cfg.get("parc_predict_type", PREDICT_TYPE_RATE))
+                ),
+                "dt_ref": physics_cfg.get("dt_ref", None),
+                "effective_dt_ref": (physics_cfg["dt_ref"] if "dt_ref" in physics_cfg else model_dt_ref),
                 "parc_detach_inputs": bool(physics_cfg.get("parc_detach_inputs", True)),
                 "parc_input_weighted": bool(physics_cfg.get("parc_input_weighted", False)),
                 "cached_dual_volume_area": bool(has_dual_volume),
@@ -3838,7 +3995,8 @@ def main(config_path: str) -> None:
                 ),
                 "layernorm_eps": float((cfg.get("model", {}) or {}).get("layernorm_eps", 1e-6)),
                 "dropout": float((cfg.get("model", {}) or {}).get("dropout", 0.0)),
-                "predict_type": str((cfg.get("model", {}) or {}).get("predict_type", "state")),
+                "predict_type": predict_type,
+                "dt_ref": model_dt_ref,
                 "use_open_boundary_source": bool(
                     (cfg.get("model", {}) or {}).get("use_open_boundary_source", True)
                 ),
@@ -3859,6 +4017,8 @@ def main(config_path: str) -> None:
                 "reverse_time": bool(reverse_time),
                 "physics_inputs_enabled": bool(_physics_inputs_enabled(cfg)),
                 "physics_backend": _physics_backend(cfg),
+                "model_predict_type": predict_type,
+                "model_dt_ref": model_dt_ref,
                 "relative_geometry_input_channels": int(relative_geometry_dim),
                 "boundary_input_channels": int(boundary_extra_dim),
                 "physics_extra_in_channels": int(physics_extra_dim),

@@ -106,7 +106,9 @@
     "layernorm_eps": 1e-06,
 
     "_comment_fluxgraphnet": "Used when model.type='fluxgraphnet'. Edge fluxes are conservative on interior/cylinder graph edges; exterior domain sides use open-boundary source terms.",
-    "predict_type": "state",
+    "_comment_predict_type": "Options for all model types: 'state' predicts x(t+1); 'delta' predicts normalized x(t+1)-x(t); 'rate' predicts the normalized time derivative and is integrated with dt/dt_ref.",
+    "predict_type": "rate",
+    "dt_ref": null,
     "flux_scale": 1.0,
     "use_dual_volume": true,
     "volume_floor": 1e-12,

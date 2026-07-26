@@ -14,8 +14,8 @@ Optional frame layout (`--pred-gt-only`) is 2x1:
   [ GT(t+1)   ]
 
 Supports:
-  - teacher-forced one-step rollout (always valid)
-  - optional autoregressive rollout (only when output channels align with input channels)
+  - autoregressive rollout by default (only when output channels align with input channels)
+  - optional teacher-forced one-step rollout (always valid)
   - optional z-slice extraction for "stored-as-3D but physically-2D" datasets
 """
 
@@ -46,10 +46,14 @@ from train_basic_point import (
     _build_physics_extra_features,
     _build_relative_geometry_node_features,
     _build_reynolds_node_feature,
+    _dt_hat_tensor,
+    _dt_ref_scalar_from_cfg,
     _forward_model,
     _infer_reynolds_number,
     _physics_inputs_enabled,
+    _predict_type_from_cfg,
     _safe_dt_scalar,
+    _state_from_model_output,
 )
 
 
@@ -766,6 +770,7 @@ def run_rollout(
         pos_std=norm_pos_std,
     )
     physics_inputs_enabled = bool(_physics_inputs_enabled(cfg))
+    predict_type = _predict_type_from_cfg(cfg)
 
     for t in range(t0, t1):
         s_t = steps[t]
@@ -808,7 +813,8 @@ def run_rollout(
                 f"target has {y_target.size(0)}."
             )
 
-        # Teacher-forced input by default.
+        # The first step starts from GT; later steps use the previous prediction
+        # when autoregressive rollout is enabled and the channel shapes align.
         x_in_abs = x_t
         can_autoreg = (
             (not force_teacher)
@@ -819,8 +825,10 @@ def run_rollout(
             x_in_abs = prev_pred_x_abs
             used_autoreg = True
 
+        dt_phys = _safe_dt_scalar(s_t.get("time", None), s_tp1.get("time", None), default_dt=1.0)
         x_abs_dev = x_in_abs.to(device=device, dtype=torch.float32)
         x_in = _maybe_norm(x_abs_dev, norm_x_mu, norm_x_std)
+        dt_hat = _dt_hat_tensor(dt_phys, cfg, device=x_in.device, dtype=x_in.dtype)
         pos_dev = pos_t.to(device=device, dtype=torch.float32)
         ei_dev = ei_t.to(device=device, dtype=torch.long)
         dual_volume_dev = (
@@ -864,7 +872,6 @@ def run_rollout(
             assert pos_in is not None
             x_parts.append(pos_in)
         if physics_inputs_enabled:
-            dt_phys = _safe_dt_scalar(s_t.get("time", None), s_tp1.get("time", None), default_dt=1.0)
             phy_extra = _build_physics_extra_features(
                 x_abs=x_abs_dev,
                 pos=pos_dev,
@@ -891,13 +898,26 @@ def run_rollout(
             )
 
         with torch.no_grad():
-            y_pred_norm, _score, _h = _forward_model(model, x_model, ei_dev, pos_dev)
+            y_model_out, _score, _h = _forward_model(
+                model,
+                x_model,
+                ei_dev,
+                pos_dev,
+                dual_volume=dual_volume_dev,
+            )
+            y_pred_norm = _state_from_model_output(x_in, y_model_out, dt_hat, predict_type)
             y_pred_abs = _maybe_denorm(y_pred_norm, norm_y_mu, norm_y_std).detach().cpu()
 
         # Update autoregressive state only when prediction matches x channels.
         prev_pred_x_abs = y_pred_abs if (y_pred_abs.shape == x_t.shape) else None
 
         gt_t_ref = _select_columns(x_t, y_cols) if x_t.size(1) != y_target.size(1) else x_t
+        input_ref = (
+            _select_columns(x_in_abs, y_cols)
+            if x_in_abs.size(1) != gt_t_ref.size(1)
+            else x_in_abs
+        )
+        input_gt_t_mae = float((input_ref.detach().cpu() - gt_t_ref.detach().cpu()).abs().mean().item())
         mae = float((y_pred_abs - y_target).abs().mean().item())
         examples.append(
             {
@@ -910,6 +930,7 @@ def run_rollout(
                 "gt_tp1": y_target.detach().cpu(),
                 "pred_tp1": y_pred_abs,
                 "mae": mae,
+                "input_gt_t_mae": input_gt_t_mae,
             }
         )
 
@@ -1007,6 +1028,9 @@ def make_rollout_gifs(
         pos = ex["pos"].numpy()
         gt_tp1 = ex["gt_tp1"].numpy()
         pred = ex["pred_tp1"].numpy()
+        frame_target_label = str(ex.get("frame_target_label", target_label))
+        frame_pred_label = str(ex.get("frame_pred_label", f"Pred({frame_target_label})"))
+        frame_error_label = str(ex.get("frame_error_label", f"Pred-{frame_target_label}"))
 
         d_pg = pred - gt_tp1
         n = pos.shape[0]
@@ -1045,15 +1069,16 @@ def make_rollout_gifs(
                     cmap=cmap_top, point_size=point_size, zoom_bbox=zoom_bbox,
                 )
 
-                ax[0, 0].set_title("Pred(t+1)")
-                ax[1, 0].set_title("GT(t+1)")
+                ax[0, 0].set_title(frame_pred_label)
+                ax[1, 0].set_title(frame_target_label)
 
                 t_abs = ex.get("t", k)
                 t_next = ex.get("t_next", t_abs + 1)
                 abs_time = _fmt_abs_time(ex.get("time_tp1", None))
                 mae = ex.get("mae", float("nan"))
+                time_label = f"initial t={t_abs}" if bool(ex.get("is_initial_frame", False)) else f"t={t_abs}->{t_next}"
                 fig.suptitle(
-                    f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                    f"{time_label}  abs_time={abs_time}  "
                     f"feat={feature_names[f]}  mae={mae:.3e}  "
                     f"points={n} (plot {len(pick)})",
                     fontsize=11,
@@ -1096,16 +1121,17 @@ def make_rollout_gifs(
                     cmap=cmap_delta, point_size=point_size, zoom_bbox=zoom_bbox,
                 )
 
-                ax[0, 0].set_title(target_label)
-                ax[1, 0].set_title(f"Pred({target_label})")
-                ax[2, 0].set_title(f"Pred-{target_label}")
+                ax[0, 0].set_title(frame_target_label)
+                ax[1, 0].set_title(frame_pred_label)
+                ax[2, 0].set_title(frame_error_label)
 
                 t_abs = ex.get("t", k)
                 t_next = ex.get("t_next", t_abs + 1)
                 abs_time = _fmt_abs_time(ex.get("time_tp1", None))
                 mae = ex.get("mae", float("nan"))
+                time_label = f"initial t={t_abs}" if bool(ex.get("is_initial_frame", False)) else f"t={t_abs}->{t_next}"
                 fig.suptitle(
-                    f"t={t_abs}->{t_next}  abs_time={abs_time}  "
+                    f"{time_label}  abs_time={abs_time}  "
                     f"feat={feature_names[f]}  mae={mae:.3e}  "
                     f"points={n} (plot {len(pick)})",
                     fontsize=11,
@@ -1141,6 +1167,23 @@ def make_rollout_gifs(
     return gif_paths
 
 
+def _with_initial_condition_frame(examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(examples) == 0:
+        return examples
+    first = examples[0]
+    init = dict(first)
+    init["t_next"] = first.get("t", 0)
+    init["time_tp1"] = first.get("time_t", None)
+    init["gt_tp1"] = first["gt_t"].clone()
+    init["pred_tp1"] = first["gt_t"].clone()
+    init["mae"] = 0.0
+    init["is_initial_frame"] = True
+    init["frame_target_label"] = "GT(t)"
+    init["frame_pred_label"] = "Pred(t) initialized from GT(t)"
+    init["frame_error_label"] = "Pred-GT(t)"
+    return [init] + examples
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Rollout GIF visualization for basic point-graph model.")
     ap.add_argument("--checkpoint", required=True, help="Path to checkpoint (e.g. runs_karman_basic/best_model.pt)")
@@ -1151,10 +1194,20 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=50, help="Number of transitions to roll out")
     ap.add_argument("--fps", type=int, default=5, help="GIF frame rate")
     ap.add_argument("--seed", type=int, default=1337, help="Random seed")
-    ap.add_argument(
+    mode_group = ap.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--autoregressive",
+        dest="autoregressive",
         action="store_true",
-        help="Enable autoregressive chaining: use Pred(t+1) as input at the next step when shapes match.",
+        default=True,
+        help="Use Pred(t+1) as input at the next step when shapes match (default).",
+    )
+    mode_group.add_argument(
+        "--teacher-forced",
+        "--no-autoregressive",
+        dest="autoregressive",
+        action="store_false",
+        help="Disable autoregressive chaining; evaluate each transition from GT Input x(t).",
     )
     ap.add_argument("--force-teacher", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--z-slice", type=int, default=None, help="When split_by_z=true, which z-slice group to use")
@@ -1192,6 +1245,11 @@ def main() -> None:
         action="store_true",
         help="If set, write GIF frames in reverse time order.",
     )
+    ap.add_argument(
+        "--include-initial-frame",
+        action="store_true",
+        help="Prepend a GIF frame at start_t with Pred(t)=GT(t) to verify the visual starting state.",
+    )
     args = ap.parse_args()
 
     set_seed(int(args.seed))
@@ -1213,6 +1271,8 @@ def main() -> None:
     pt_path = str(cfg.get("data", {}).get("pt_path", "")).strip()
     if not pt_path:
         raise RuntimeError("cfg.data.pt_path is not set; provide --pt-path.")
+    predict_type = _predict_type_from_cfg(cfg)
+    model_dt_ref = _dt_ref_scalar_from_cfg(cfg)
 
     if args.out_dir is None:
         base = os.path.dirname(os.path.abspath(args.checkpoint))
@@ -1251,8 +1311,12 @@ def main() -> None:
 
     t_start = time.perf_counter()
     if bool(args.autoregressive) and bool(args.force_teacher):
-        print("[WARN] --autoregressive and --force-teacher were both set; using teacher forcing.")
+        print("[WARN] --force-teacher overrides autoregressive mode; use --teacher-forced or --no-autoregressive instead.")
     force_teacher = (not bool(args.autoregressive)) or bool(args.force_teacher)
+    rollout_mode = "teacher-forced" if force_teacher else "autoregressive"
+    print(f"[INFO] rollout mode: {rollout_mode}")
+    dt_ref_msg = "none (using raw dt)" if model_dt_ref is None else f"{model_dt_ref:g}"
+    print(f"[INFO] model output predict_type: {predict_type} dt_ref={dt_ref_msg}")
 
     examples, used_autoreg = run_rollout(
         model=model,
@@ -1274,14 +1338,27 @@ def main() -> None:
         expected_in_dim=(expected_in_dim if expected_in_dim > 0 else None),
     )
     t_roll = time.perf_counter() - t_start
+    initial_input_gt_t_mae = float(examples[0].get("input_gt_t_mae", float("nan")))
+    model_uses_dual_volume = bool(getattr(model, "uses_dual_volume", False))
+    dual_volume_passed_to_model = bool(model_uses_dual_volume and has_dual_volume)
+    if model_uses_dual_volume:
+        if has_dual_volume:
+            print("[INFO] model uses dual_volume; passing per-node volumes during rollout.")
+        else:
+            print("[WARN] model uses dual_volume, but this rollout data did not expose dual_volume.")
 
     feat_cols = cfg.get("features", {}).get("target_columns", None)
     feat_names = _choose_feature_names(cfg, feat_cols, int(examples[0]["pred_tp1"].shape[1]))
     zoom_bbox = _parse_zoom_bbox(args.zoom_bbox)
+    gif_examples = (
+        _with_initial_condition_frame(examples)
+        if bool(args.include_initial_frame)
+        else examples
+    )
 
     t_gif0 = time.perf_counter()
     gif_paths = make_rollout_gifs(
-        examples=examples,
+        examples=gif_examples,
         feature_names=feat_names,
         out_dir=out_dir,
         fps=int(args.fps),
@@ -1307,18 +1384,26 @@ def main() -> None:
         "checkpoint": os.path.abspath(args.checkpoint),
         "pt_path": os.path.abspath(os.path.expanduser(pt_path)),
         "n_steps": len(examples),
+        "n_gif_frames": len(gif_examples),
         "start_t": int(args.start_t),
         "horizon": int(args.horizon),
+        "rollout_mode": rollout_mode,
+        "predict_type": predict_type,
+        "model_dt_ref": model_dt_ref,
         "force_teacher": bool(force_teacher),
         "autoregressive_requested": bool(args.autoregressive),
         "used_autoregressive": bool(used_autoreg),
         "z_slice": args.z_slice,
         "source_reynolds": (None if source_reynolds is None else float(source_reynolds)),
         "has_dual_volume": bool(has_dual_volume),
+        "model_uses_dual_volume": bool(model_uses_dual_volume),
+        "dual_volume_passed_to_model": bool(dual_volume_passed_to_model),
+        "initial_input_gt_t_mae": initial_input_gt_t_mae,
         "mean_mae": mean_mae,
         "target_label": target_label,
         "input_label": input_label,
         "pred_gt_only": bool(args.pred_gt_only),
+        "include_initial_frame": bool(args.include_initial_frame),
         "reverse_time": bool(args.reverse_time),
         "render_mode": str(args.render_mode),
         "tri_edge_quantile": float(args.tri_edge_quantile),
@@ -1331,7 +1416,8 @@ def main() -> None:
         json.dump(summary, f, indent=2)
 
     print(f"[DONE] frames={len(examples)} mean_mae={mean_mae:.6e}")
-    print(f"[DONE] used_autoregressive={used_autoreg} force_teacher={bool(force_teacher)}")
+    print(f"[DONE] initial_input_gt_t_mae={initial_input_gt_t_mae:.6e}")
+    print(f"[DONE] rollout_mode={rollout_mode} used_autoregressive={used_autoreg} force_teacher={bool(force_teacher)}")
     print(f"[DONE] rollout_time={t_roll:.2f}s gif_time={t_gif:.2f}s")
     for p in gif_paths:
         print(f"[DONE] wrote {p}")
